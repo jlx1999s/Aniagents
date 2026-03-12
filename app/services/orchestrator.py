@@ -19,7 +19,10 @@ from app.graph.routing import (
     NODE_STORYBOARD_ARTIST,
 )
 from app.graph.state import ManjuState, create_initial_state
-from app.tools.mcp_client import generate_chat_reply_tool
+from app.services.manager_agent import ManagerAgent
+from app.services.review_gateway import ReviewGateway
+from app.services.tool_executor import ToolizedAgentExecutor
+from app.tools.mcp_client import generate_structured_role_reply_tool
 
 AGENT_SEQUENCE = [
     (NODE_SCRIPTWRITER, scriptwriter_agent, "分镜拆解"),
@@ -44,6 +47,12 @@ NODE_ETA = {
 
 STAGE_TO_INDEX = {stage[0]: idx for idx, stage in enumerate(AGENT_SEQUENCE)}
 NODE_LABELS = {stage[0]: stage[2] for stage in AGENT_SEQUENCE}
+NODE_ACTORS = {
+    NODE_SCRIPTWRITER: "分镜师Agent",
+    NODE_CHARACTER_DESIGNER: "角色设计师Agent",
+    NODE_STORYBOARD_ARTIST: "分镜画师Agent",
+    NODE_ANIMATION_ARTIST: "动画师Agent",
+}
 
 
 def _build_asset_preview(asset: Dict[str, object], kind: str) -> Dict[str, object]:
@@ -81,6 +90,9 @@ class ProjectOrchestrator:
     def __init__(self) -> None:
         self._store: Dict[str, ProjectRuntime] = {}
         self._lock = Lock()
+        self._manager_agent = ManagerAgent()
+        self._tool_executor = ToolizedAgentExecutor()
+        self._review_gateway = ReviewGateway()
         self._json_storage_path = (
             Path(__file__).resolve().parents[1] / "static" / "data" / "projects_runtime.json"
         )
@@ -404,14 +416,143 @@ class ProjectOrchestrator:
         )
 
     def _agent_chat_reply(self, runtime: ProjectRuntime, user_message: str) -> str:
-        stage = runtime.state.get("approval_stage") or NODE_LABELS.get(self._next_node(runtime) or "", "流程调度")
-        guidance = self._agent_guidance(runtime)
-        context = (
-            f"当前阶段：{stage}；"
-            f"项目状态：{runtime.status}；"
-            f"{guidance}"
+        preferred_node = self._next_node(runtime)
+        decision = self._manager_agent.decide(
+            status=runtime.status,
+            awaiting_review=runtime.awaiting_review,
+            current_index=runtime.current_index,
+            sequence=AGENT_SEQUENCE,
+            preferred_node=preferred_node,
+            history_tail=runtime.history[-6:],
         )
-        return generate_chat_reply_tool(user_message=user_message, context=context, stage="scriptwriter")
+        stage = runtime.state.get("approval_stage") or NODE_LABELS.get(preferred_node or "", "流程调度")
+        if decision.action == "execute":
+            target_node = decision.next_node or preferred_node
+            target_actor = self._actor_name(target_node)
+            target_label = NODE_LABELS.get(target_node or "", target_node or "未知节点")
+            basis = (
+                f"当前状态为{runtime.status}，且未被审核门禁阻断。"
+                f"Manager判定执行路径为{target_label}。"
+            )
+            dispatch = f"我将派工给{target_actor}，执行「{target_label}」。"
+            next_commands = " / ".join(self._suggested_commands(runtime)[:3])
+            return (
+                f"收到，已确认需求：{user_message}。\n"
+                f"决策依据：{basis}\n"
+                f"派工对象：{dispatch}\n"
+                f"下一步指令：{next_commands}"
+            )
+        if decision.action == "await_review":
+            next_commands = " / ".join(self._suggested_commands(runtime)[:3])
+            return (
+                f"收到，已确认需求：{user_message}。\n"
+                f"决策依据：当前处于{stage}审核门禁，需先完成审核。\n"
+                f"派工对象：暂不派工，等待项目操作员审批。\n"
+                f"下一步指令：{next_commands}"
+            )
+        if decision.action == "complete":
+            return (
+                f"收到，已确认需求：{user_message}。\n"
+                f"决策依据：全部关键节点已完成，流程进入完成态。\n"
+                f"派工对象：无需派工。\n"
+                "下一步指令：可提出重做或风格优化指令。"
+            )
+        return (
+            f"收到，已确认需求：{user_message}。\n"
+            f"决策依据：当前状态为{runtime.status}，流程保持不变。\n"
+            f"派工对象：无。\n"
+            f"下一步指令：{' / '.join(self._suggested_commands(runtime)[:3])}"
+        )
+
+    def _worker_chat_reply(self, runtime: ProjectRuntime, user_message: str, node_name: str) -> str:
+        actor = self._actor_name(node_name)
+        node_label = NODE_LABELS.get(node_name, node_name)
+        suggestions = self._suggested_commands(runtime)[:3]
+        llm_payload = generate_structured_role_reply_tool(
+            role=actor,
+            user_message=user_message,
+            target_label=node_label,
+            target_actor=actor,
+            suggested_commands=suggestions,
+            context=self._agent_guidance(runtime),
+            stage="scriptwriter",
+        )
+        return (
+            f"{llm_payload['ack']}\n"
+            f"当前动作：{llm_payload['action']}\n"
+            f"执行重点：按当前项目风格与目标优先完成该节点。\n"
+            f"下一步指令：{llm_payload['next']}"
+        )
+
+    def _director_dispatch_reply(self, runtime: ProjectRuntime, user_message: str, node_name: str) -> str:
+        actor = self._actor_name(node_name)
+        label = NODE_LABELS.get(node_name, node_name)
+        suggestions = self._suggested_commands(runtime)[:3]
+        llm_payload = generate_structured_role_reply_tool(
+            role="导演",
+            user_message=user_message,
+            target_label=label,
+            target_actor=actor,
+            suggested_commands=suggestions,
+            context=self._agent_guidance(runtime),
+            stage="scriptwriter",
+        )
+        return (
+            f"{llm_payload['ack']}\n"
+            f"决策依据：{llm_payload['basis']}\n"
+            f"派工对象：{llm_payload['dispatch']}\n"
+            f"下一步指令：{llm_payload['next']}"
+        )
+
+    def _actor_name(self, node_name: Optional[str]) -> str:
+        if not node_name:
+            return "导演"
+        return NODE_ACTORS.get(node_name, node_name)
+
+    def _manager_thought(self, runtime: ProjectRuntime, action: str, next_node: Optional[str]) -> str:
+        if action == "await_review":
+            stage = runtime.state.get("approval_stage") or "当前阶段"
+            return f"检测到审批门禁未解除，需要先进行{stage}审核。"
+        if action == "complete":
+            return "全部关键节点已执行完成，项目可以进入完成态。"
+        if action == "execute":
+            node_label = NODE_LABELS.get(next_node or "", next_node or "未知节点")
+            return f"当前无阻塞，调度下一个最优节点：{node_label}。"
+        return "保持当前状态，等待下一步条件满足。"
+
+    def _manager_reply(self, action: str, next_node: Optional[str]) -> str:
+        if action == "execute":
+            node_label = NODE_LABELS.get(next_node or "", next_node or "未知节点")
+            return f"我将派发任务给{node_label}。"
+        if action == "await_review":
+            return "当前流程进入审核等待，请先完成审核指令。"
+        if action == "complete":
+            return "项目流程已全部完成。"
+        return "当前流程保持不变。"
+
+    def _tool_thought(self, node_name: str) -> str:
+        label = NODE_LABELS.get(node_name, node_name)
+        return f"接收到导演调度，开始执行{label}任务并生成产物。"
+
+    def _tool_reply(self, runtime: ProjectRuntime, node_name: str) -> str:
+        state = runtime.state
+        if node_name == NODE_SCRIPTWRITER:
+            scenes = state.get("script_data", {}).get("scenes", [])
+            count = len(scenes) if isinstance(scenes, list) else 0
+            return f"分镜拆解完成，已生成{count}个镜头段落。"
+        if node_name == NODE_CHARACTER_DESIGNER:
+            assets = state.get("character_assets", {})
+            count = len(assets) if isinstance(assets, dict) else 0
+            return f"角色设计完成，已输出{count}个角色资产。"
+        if node_name == NODE_STORYBOARD_ARTIST:
+            frames = state.get("storyboard_frames", [])
+            count = len(frames) if isinstance(frames, list) else 0
+            return f"分镜图生成完成，已输出{count}帧关键画面。"
+        if node_name == NODE_ANIMATION_ARTIST:
+            clips = state.get("video_clips", [])
+            count = len(clips) if isinstance(clips, list) else 0
+            return f"视频生成完成，已输出{count}段视频素材。"
+        return "节点执行完成。"
 
     def _append_chat_log(self, runtime: ProjectRuntime, role: str, message: str) -> None:
         payload = {
@@ -427,9 +568,12 @@ class ProjectOrchestrator:
         runtime.review_logs.append(payload)
         self._append_activity(runtime, "review", payload)
 
-    def _append_history(self, runtime: ProjectRuntime, event: str) -> None:
+    def _append_history(self, runtime: ProjectRuntime, event: str, actor: Optional[str] = None) -> None:
         runtime.history.append(event)
-        self._append_activity(runtime, "history", {"event": event})
+        payload: Dict[str, object] = {"event": event}
+        if actor:
+            payload["actor"] = actor
+        self._append_activity(runtime, "history", payload)
 
     def _append_activity(self, runtime: ProjectRuntime, kind: str, payload: Dict[str, object]) -> None:
         runtime.activity_logs.append(
@@ -538,6 +682,8 @@ class ProjectOrchestrator:
             runtime = self._store.get(project_id)
             if runtime is None:
                 raise KeyError(project_id)
+            assistant_target_node: Optional[str] = None
+            director_dispatch_required = False
             self._append_chat_log(runtime, operator_id, text)
             if any(keyword in text for keyword in ["放弃项目", "终止项目"]):
                 runtime.status = "rejected"
@@ -576,6 +722,8 @@ class ProjectOrchestrator:
                 runtime.state["approval_required"] = False
                 runtime.state["approval_stage"] = None
                 self._append_history(runtime, "chat_update_prompt")
+                assistant_target_node = NODE_SCRIPTWRITER
+                director_dispatch_required = True
             elif (
                 not runtime.awaiting_review
                 and runtime.current_index == STAGE_TO_INDEX[NODE_CHARACTER_DESIGNER]
@@ -598,6 +746,8 @@ class ProjectOrchestrator:
                     },
                 )
                 self._append_history(runtime, "chat_revise_script")
+                assistant_target_node = NODE_SCRIPTWRITER
+                director_dispatch_required = True
             elif runtime.awaiting_review and any(
                 keyword in text for keyword in ["确认风格", "确认", "通过", "继续"]
             ):
@@ -617,6 +767,8 @@ class ProjectOrchestrator:
                     },
                 )
                 self._append_history(runtime, "chat_approved")
+                assistant_target_node = self._next_node(runtime)
+                director_dispatch_required = assistant_target_node is not None
             elif runtime.awaiting_review and any(
                 keyword in text for keyword in ["修改风格", "风格", "改成", "换成"]
             ):
@@ -637,6 +789,8 @@ class ProjectOrchestrator:
                     },
                 )
                 self._append_history(runtime, "chat_revise_style")
+                assistant_target_node = NODE_CHARACTER_DESIGNER
+                director_dispatch_required = True
             elif any(keyword in text for keyword in ["重做", "返修", "修改"]):
                 target = self._infer_target_node(text) or self._next_node(runtime) or NODE_STORYBOARD_ARTIST
                 runtime.current_index = STAGE_TO_INDEX[target]
@@ -655,10 +809,30 @@ class ProjectOrchestrator:
                     },
                 )
                 self._append_history(runtime, f"chat_revise:{target}")
+                assistant_target_node = target
+                director_dispatch_required = True
+            elif (
+                not runtime.awaiting_review
+                and any(keyword in text for keyword in ["开始下一阶段", "开始", "继续", "继续生成", "执行当前阶段"])
+            ):
+                runtime.status = "running"
+                target = self._next_node(runtime) or NODE_SCRIPTWRITER
+                assistant_target_node = target
+                director_dispatch_required = True
             elif runtime.status not in {"completed", "rejected", "failed"}:
                 runtime.status = "running"
-            assistant_message = self._agent_chat_reply(runtime, text)
-            self._append_chat_log(runtime, "Agent", assistant_message)
+            if assistant_target_node:
+                if director_dispatch_required:
+                    self._append_chat_log(
+                        runtime,
+                        "导演",
+                        self._director_dispatch_reply(runtime, text, assistant_target_node),
+                    )
+                assistant_message = self._worker_chat_reply(runtime, text, assistant_target_node)
+                self._append_chat_log(runtime, self._actor_name(assistant_target_node), assistant_message)
+            else:
+                assistant_message = self._agent_chat_reply(runtime, text)
+                self._append_chat_log(runtime, "导演", assistant_message)
             self._persist_store_locked()
             return runtime
 
@@ -675,36 +849,98 @@ class ProjectOrchestrator:
                 self._persist_store_locked()
                 return runtime
             runtime.last_advanced_at = now
-            if runtime.awaiting_review:
+            preferred_node = None
+            if runtime.current_index < len(AGENT_SEQUENCE):
+                preferred_node = AGENT_SEQUENCE[runtime.current_index][0]
+            decision = self._manager_agent.decide(
+                status=runtime.status,
+                awaiting_review=runtime.awaiting_review,
+                current_index=runtime.current_index,
+                sequence=AGENT_SEQUENCE,
+                preferred_node=preferred_node,
+                history_tail=runtime.history[-6:],
+            )
+            self._append_activity(
+                runtime,
+                "manager_decision",
+                {
+                    "actor": "导演",
+                    "action": decision.action,
+                    "next_node": decision.next_node,
+                    "reason": decision.reason,
+                    "thought": self._manager_thought(runtime, decision.action, decision.next_node),
+                    "reply": self._manager_reply(decision.action, decision.next_node),
+                    "metadata": decision.metadata,
+                },
+            )
+            if decision.action == "await_review":
+                runtime.status = "waiting_review"
                 self._persist_store_locked()
                 return runtime
-            if runtime.current_index >= len(AGENT_SEQUENCE):
+            if decision.action == "complete":
                 runtime.status = "completed"
+                runtime.awaiting_review = False
+                runtime.current_index = len(AGENT_SEQUENCE)
                 self._persist_store_locked()
                 return runtime
-            node_name, handler, _ = AGENT_SEQUENCE[runtime.current_index]
+            if decision.action != "execute" or not decision.next_node:
+                self._persist_store_locked()
+                return runtime
+            selected_index = STAGE_TO_INDEX.get(decision.next_node, runtime.current_index)
+            node_name, handler, _ = AGENT_SEQUENCE[selected_index]
             try:
-                runtime.state = handler(runtime.state)
+                execution = self._tool_executor.execute(
+                    node_name=node_name,
+                    handler=handler,
+                    state=runtime.state,
+                )
+                runtime.state = execution.state
+                self._append_activity(
+                    runtime,
+                    "tool_execution",
+                    {
+                        **execution.metadata,
+                        "actor": self._actor_name(node_name),
+                        "thought": self._tool_thought(node_name),
+                        "reply": self._tool_reply(runtime, node_name),
+                    },
+                )
+                self._append_chat_log(runtime, self._actor_name(node_name), self._tool_reply(runtime, node_name))
             except Exception as exc:
                 runtime.status = "failed"
                 runtime.awaiting_review = False
                 runtime.state["errors"].append({"node": node_name, "error": str(exc)})
                 self._persist_store_locked()
                 return runtime
+            runtime.current_index = selected_index
             runtime.step_count += 1
-            self._append_history(runtime, node_name)
+            self._append_history(runtime, node_name, actor=self._actor_name(node_name))
             runtime.state["cost_usage"][node_name] = runtime.state["cost_usage"].get(
                 node_name, 0.0
             ) + NODE_COST[node_name]
-            if runtime.state["approval_required"]:
-                runtime.awaiting_review = True
-                runtime.status = "waiting_review"
-            else:
-                runtime.current_index += 1
-            if node_name == NODE_ANIMATION_ARTIST and runtime.state.get("final_video"):
-                runtime.current_index = len(AGENT_SEQUENCE)
-                runtime.status = "completed"
-                runtime.awaiting_review = False
+            gateway_decision = self._review_gateway.evaluate_after_execute(
+                node_name=node_name,
+                current_index=runtime.current_index,
+                total_nodes=len(AGENT_SEQUENCE),
+                state=runtime.state,
+            )
+            self._append_activity(
+                runtime,
+                "review_gateway",
+                {
+                    "actor": "审核网关",
+                    "status": gateway_decision.status,
+                    "awaiting_review": gateway_decision.awaiting_review,
+                    "next_index": gateway_decision.next_index,
+                    "reason": gateway_decision.reason,
+                    "thought": "根据审核策略评估成本、质量与风险门禁。",
+                    "reply": f"网关判定为{gateway_decision.status}。",
+                    "metadata": gateway_decision.metadata,
+                },
+            )
+            runtime.awaiting_review = gateway_decision.awaiting_review
+            runtime.status = gateway_decision.status
+            runtime.current_index = gateway_decision.next_index
             if runtime.state["iteration_count"] > runtime.state["max_iterations"]:
                 runtime.status = "failed"
                 runtime.state["errors"].append(

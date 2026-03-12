@@ -15,6 +15,15 @@
         "params": {}
       }
     },
+    "manager": {
+      "decision": {
+        "provider": "vectorengine",
+        "baseUrl": "https://api.vectorengine.ai",
+        "model": "gemini-2.5-pro",
+        "enabled": true,
+        "params": {}
+      }
+    },
     "art-director": {
       "style": {
         "provider": "vectorengine",

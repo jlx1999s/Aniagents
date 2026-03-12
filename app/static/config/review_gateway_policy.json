@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "updatedAt": "",
+  "rules": {
+    "maxRenderCostBeforeApproval": null,
+    "manualApprovalNodes": [],
+    "minQaScoreByNode": {},
+    "forceApprovalOnErrors": true
+  }
+}

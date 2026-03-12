@@ -58,7 +58,7 @@ def _build_scenes(result: Dict[str, Any], user_prompt: str) -> List[Dict[str, An
 def scriptwriter_agent(state: ManjuState) -> ManjuState:
     result = generate_script_tool(
         f"请基于以下小说文本做分镜拆解并输出镜头段落：{state['user_prompt']}",
-        stage="storyboard_decomposition",
+        stage="scriptwriter",
     )
     state["script_data"] = {
         "scenes": _build_scenes(result, state["user_prompt"]),

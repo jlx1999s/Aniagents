@@ -10,6 +10,7 @@ DEFAULT_ROUTES: Dict[str, Any] = {
     "defaults": {"provider": "mock", "baseUrl": ""},
     "routes": {
         "scriptwriter": {"script": {"provider": "mock", "baseUrl": "", "model": "script-mock", "enabled": True, "params": {}}},
+        "manager": {"decision": {"provider": "mock", "baseUrl": "", "model": "manager-mock", "enabled": True, "params": {}}},
         "art-director": {"style": {"provider": "mock", "baseUrl": "", "model": "style-mock", "enabled": True, "params": {}}},
         "character": {"image": {"provider": "mock", "baseUrl": "", "model": "image-mock", "enabled": True, "params": {}}},
         "storyboard": {"image": {"provider": "mock", "baseUrl": "", "model": "image-mock", "enabled": True, "params": {}}},
@@ -109,4 +110,3 @@ def resolve_params(stage: str, task: str) -> Dict[str, Any]:
             "params": params,
         }
     }
-
