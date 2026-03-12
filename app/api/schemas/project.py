@@ -1,0 +1,44 @@
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel
+
+
+class CreateProjectRequest(BaseModel):
+    user_prompt: str
+
+
+class CreateProjectResponse(BaseModel):
+    project_id: str
+
+
+class ReviewRequest(BaseModel):
+    action: Literal["approve", "revise", "reject"]
+    target_node: Optional[str] = None
+    message: Optional[str] = None
+    stage: Optional[str] = None
+    issue_type: Optional[str] = None
+    priority: Optional[Literal["low", "medium", "high"]] = "medium"
+    operator_id: Optional[str] = "anonymous"
+
+
+class ProjectSnapshot(BaseModel):
+    projectId: str
+    prompt: str
+    stage: str
+    mode: str
+    status: str
+    qualityPass: int
+    qualityTotal: int
+    renderCost: float
+    eta: str
+    approvalRequired: bool
+    approvalStage: Optional[str]
+    currentNode: str
+    finalVideoUri: Optional[str]
+    assets: dict
+    assetGallery: dict
+    nodeMetrics: List[dict]
+    latestReview: Optional[dict]
+    reviewLogs: List[dict]
+    history: List[str]
+    errors: List[dict]

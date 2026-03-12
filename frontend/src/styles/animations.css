@@ -1,0 +1,16 @@
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.hero-center,
+.data-panel,
+.spine-bar {
+  animation: fadeUp 800ms ease both;
+}

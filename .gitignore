@@ -1,0 +1,17 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+node_modules/
+dist/
+frontend/node_modules/
+frontend/dist/
+app/static/generated/
+*.log
