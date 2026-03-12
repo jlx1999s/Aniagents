@@ -48,10 +48,10 @@ NODE_ETA = {
 STAGE_TO_INDEX = {stage[0]: idx for idx, stage in enumerate(AGENT_SEQUENCE)}
 NODE_LABELS = {stage[0]: stage[2] for stage in AGENT_SEQUENCE}
 NODE_ACTORS = {
-    NODE_SCRIPTWRITER: "分镜师Agent",
-    NODE_CHARACTER_DESIGNER: "角色设计师Agent",
-    NODE_STORYBOARD_ARTIST: "分镜画师Agent",
-    NODE_ANIMATION_ARTIST: "动画师Agent",
+    NODE_SCRIPTWRITER: "分镜师",
+    NODE_CHARACTER_DESIGNER: "角色设计师",
+    NODE_STORYBOARD_ARTIST: "分镜画师",
+    NODE_ANIMATION_ARTIST: "动画师",
 }
 
 
