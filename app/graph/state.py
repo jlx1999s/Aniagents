@@ -54,6 +54,7 @@ class ManjuState(TypedDict):
     max_iterations: int
     cost_usage: Dict[str, float]
     timing_ms: Dict[str, int]
+    timing_last_ms: Dict[str, int]
     errors: List[Dict[str, Any]]
 
 
@@ -80,5 +81,6 @@ def create_initial_state(user_prompt: str, project_id: Optional[str] = None) -> 
         max_iterations=20,
         cost_usage={},
         timing_ms={},
+        timing_last_ms={},
         errors=[],
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -262,8 +263,10 @@ class ProjectOrchestrator:
             return None
         return AGENT_SEQUENCE[runtime.current_index][0]
 
-    def _execution_plan(self, runtime: ProjectRuntime) -> List[Dict[str, str]]:
-        plan: List[Dict[str, str]] = []
+    def _execution_plan(self, runtime: ProjectRuntime) -> List[Dict[str, object]]:
+        plan: List[Dict[str, object]] = []
+        timing_ms = runtime.state.get("timing_ms") or {}
+        timing_last_ms = runtime.state.get("timing_last_ms") or {}
         for index, (node, _, label) in enumerate(AGENT_SEQUENCE):
             if runtime.status == "completed":
                 status = "completed"
@@ -275,7 +278,16 @@ class ProjectOrchestrator:
                 status = "next"
             else:
                 status = "queued"
-            plan.append({"node": node, "label": label, "status": status})
+            plan.append(
+                {
+                    "node": node,
+                    "label": label,
+                    "status": status,
+                    "actualDurationMs": int(timing_ms.get(node, 0)),
+                    "lastDurationMs": int(timing_last_ms.get(node, 0)),
+                    "runCount": runtime.history.count(node),
+                }
+            )
         return plan
 
     def _storyboard_table(self, state: ManjuState) -> List[Dict[str, str]]:
@@ -613,6 +625,8 @@ class ProjectOrchestrator:
             runtime = self._store.get(project_id)
             if runtime is None:
                 raise KeyError(project_id)
+            if action in {"approve", "revise", "reject"} and not runtime.awaiting_review:
+                raise ValueError("review_not_required")
             if action == "approve":
                 resolved_stage = stage or runtime.state.get("approval_stage") or ""
                 self._mark_approval_resolved(runtime)
@@ -837,6 +851,10 @@ class ProjectOrchestrator:
             return runtime
 
     def advance(self, project_id: str, force: bool = False) -> ProjectRuntime:
+        selected_index: Optional[int] = None
+        node_name: Optional[str] = None
+        handler = None
+        execute_state: Optional[ManjuState] = None
         with self._lock:
             runtime = self._store.get(project_id)
             if runtime is None:
@@ -888,30 +906,50 @@ class ProjectOrchestrator:
                 return runtime
             selected_index = STAGE_TO_INDEX.get(decision.next_node, runtime.current_index)
             node_name, handler, _ = AGENT_SEQUENCE[selected_index]
-            try:
-                execution = self._tool_executor.execute(
-                    node_name=node_name,
-                    handler=handler,
-                    state=runtime.state,
-                )
-                runtime.state = execution.state
-                self._append_activity(
-                    runtime,
-                    "tool_execution",
-                    {
-                        **execution.metadata,
-                        "actor": self._actor_name(node_name),
-                        "thought": self._tool_thought(node_name),
-                        "reply": self._tool_reply(runtime, node_name),
-                    },
-                )
-                self._append_chat_log(runtime, self._actor_name(node_name), self._tool_reply(runtime, node_name))
-            except Exception as exc:
+            runtime.current_index = selected_index
+            runtime.awaiting_review = False
+            runtime.status = "running"
+            runtime.state["current_node"] = node_name
+            execute_state = deepcopy(runtime.state)
+            self._persist_store_locked()
+        try:
+            execute_started_at = time.perf_counter()
+            execution = self._tool_executor.execute(
+                node_name=node_name,
+                handler=handler,
+                state=execute_state,
+            )
+            elapsed_ms = int((time.perf_counter() - execute_started_at) * 1000)
+        except Exception as exc:
+            with self._lock:
+                runtime = self._store.get(project_id)
+                if runtime is None:
+                    raise KeyError(project_id)
                 runtime.status = "failed"
                 runtime.awaiting_review = False
                 runtime.state["errors"].append({"node": node_name, "error": str(exc)})
                 self._persist_store_locked()
                 return runtime
+        with self._lock:
+            runtime = self._store.get(project_id)
+            if runtime is None:
+                raise KeyError(project_id)
+            runtime.state = execution.state
+            timing_ms = runtime.state.setdefault("timing_ms", {})
+            timing_ms[node_name] = int(timing_ms.get(node_name, 0)) + max(elapsed_ms, 0)
+            timing_last_ms = runtime.state.setdefault("timing_last_ms", {})
+            timing_last_ms[node_name] = max(elapsed_ms, 0)
+            self._append_activity(
+                runtime,
+                "tool_execution",
+                {
+                    **execution.metadata,
+                    "actor": self._actor_name(node_name),
+                    "thought": self._tool_thought(node_name),
+                    "reply": self._tool_reply(runtime, node_name),
+                },
+            )
+            self._append_chat_log(runtime, self._actor_name(node_name), self._tool_reply(runtime, node_name))
             runtime.current_index = selected_index
             runtime.step_count += 1
             self._append_history(runtime, node_name, actor=self._actor_name(node_name))
@@ -965,6 +1003,8 @@ class ProjectOrchestrator:
             quality_total = 5
             render_cost = round(sum(state["cost_usage"].values()), 2)
             eta = NODE_ETA.get(current_node, "00:00:20")
+            timing_ms = state.get("timing_ms") or {}
+            timing_last_ms = state.get("timing_last_ms") or {}
             node_metrics = []
             for idx, (node_name, _, display_name) in enumerate(AGENT_SEQUENCE):
                 run_count = runtime.history.count(node_name)
@@ -985,6 +1025,8 @@ class ProjectOrchestrator:
                         "status": node_status,
                         "runCount": run_count,
                         "cost": round(state["cost_usage"].get(node_name, 0.0), 2),
+                        "durationMs": int(timing_ms.get(node_name, 0)),
+                        "lastDurationMs": int(timing_last_ms.get(node_name, 0)),
                     }
                 )
             assets = {
