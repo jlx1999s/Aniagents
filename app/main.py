@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routers import projects_router
+from app.api.routers import projects_router, settings_router
 
 app = FastAPI(title="Manju Platform API", version="0.1.0")
 static_root = Path(__file__).resolve().parent / "static"
@@ -25,4 +25,5 @@ def health():
 
 
 app.include_router(projects_router)
+app.include_router(settings_router)
 app.mount("/assets", StaticFiles(directory=static_root), name="assets")

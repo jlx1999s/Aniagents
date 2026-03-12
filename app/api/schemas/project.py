@@ -21,6 +21,11 @@ class ReviewRequest(BaseModel):
     operator_id: Optional[str] = "anonymous"
 
 
+class ChatRequest(BaseModel):
+    message: str
+    operator_id: Optional[str] = "anonymous"
+
+
 class ProjectSnapshot(BaseModel):
     projectId: str
     prompt: str
@@ -37,8 +42,15 @@ class ProjectSnapshot(BaseModel):
     finalVideoUri: Optional[str]
     assets: dict
     assetGallery: dict
+    storyboardTable: List[dict]
     nodeMetrics: List[dict]
     latestReview: Optional[dict]
     reviewLogs: List[dict]
+    chatLogs: List[dict]
+    activityLogs: List[dict]
+    executionPlan: List[dict]
+    executionPlanSummary: str
+    suggestedCommands: List[str]
+    targetNodeOptions: List[dict]
     history: List[str]
     errors: List[dict]

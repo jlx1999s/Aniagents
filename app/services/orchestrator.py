@@ -1,60 +1,49 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.agents.animation_artist import animation_artist_agent
-from app.agents.art_director import art_director_agent
 from app.agents.character_designer import character_designer_agent
-from app.agents.compositor import compositor_agent
 from app.agents.scriptwriter import scriptwriter_agent
-from app.agents.sound_director import sound_director_agent
 from app.agents.storyboard_artist import storyboard_artist_agent
 from app.graph.routing import (
     NODE_ANIMATION_ARTIST,
-    NODE_ART_DIRECTOR,
     NODE_CHARACTER_DESIGNER,
-    NODE_COMPOSITOR,
     NODE_SCRIPTWRITER,
-    NODE_SOUND_DIRECTOR,
     NODE_STORYBOARD_ARTIST,
 )
 from app.graph.state import ManjuState, create_initial_state
+from app.tools.mcp_client import generate_chat_reply_tool
 
 AGENT_SEQUENCE = [
-    (NODE_SCRIPTWRITER, scriptwriter_agent, "Scriptwriting"),
-    (NODE_ART_DIRECTOR, art_director_agent, "Style Definition"),
-    (NODE_CHARACTER_DESIGNER, character_designer_agent, "Character Review"),
-    (NODE_STORYBOARD_ARTIST, storyboard_artist_agent, "Storyboard Review"),
-    (NODE_ANIMATION_ARTIST, animation_artist_agent, "Animation Render"),
-    (NODE_SOUND_DIRECTOR, sound_director_agent, "Audio Align"),
-    (NODE_COMPOSITOR, compositor_agent, "Compositor"),
+    (NODE_SCRIPTWRITER, scriptwriter_agent, "分镜拆解"),
+    (NODE_CHARACTER_DESIGNER, character_designer_agent, "角色生成"),
+    (NODE_STORYBOARD_ARTIST, storyboard_artist_agent, "分镜图生成"),
+    (NODE_ANIMATION_ARTIST, animation_artist_agent, "视频生成"),
 ]
 
 NODE_COST = {
-    NODE_SCRIPTWRITER: 0.42,
-    NODE_ART_DIRECTOR: 0.65,
+    NODE_SCRIPTWRITER: 0.8,
     NODE_CHARACTER_DESIGNER: 2.8,
-    NODE_STORYBOARD_ARTIST: 2.2,
-    NODE_ANIMATION_ARTIST: 3.6,
-    NODE_SOUND_DIRECTOR: 1.4,
-    NODE_COMPOSITOR: 1.8,
+    NODE_STORYBOARD_ARTIST: 2.6,
+    NODE_ANIMATION_ARTIST: 4.2,
 }
 
 NODE_ETA = {
-    NODE_SCRIPTWRITER: "00:05:00",
-    NODE_ART_DIRECTOR: "00:04:30",
-    NODE_CHARACTER_DESIGNER: "00:04:10",
-    NODE_STORYBOARD_ARTIST: "00:03:50",
-    NODE_ANIMATION_ARTIST: "00:03:10",
-    NODE_SOUND_DIRECTOR: "00:02:20",
-    NODE_COMPOSITOR: "00:01:00",
+    NODE_SCRIPTWRITER: "00:02:40",
+    NODE_CHARACTER_DESIGNER: "00:03:30",
+    NODE_STORYBOARD_ARTIST: "00:02:50",
+    NODE_ANIMATION_ARTIST: "00:04:20",
 }
 
 STAGE_TO_INDEX = {stage[0]: idx for idx, stage in enumerate(AGENT_SEQUENCE)}
+NODE_LABELS = {stage[0]: stage[2] for stage in AGENT_SEQUENCE}
 
 
 def _build_asset_preview(asset: Dict[str, object], kind: str) -> Dict[str, object]:
@@ -84,19 +73,162 @@ class ProjectRuntime:
     last_advanced_at: float = 0.0
     history: List[str] = field(default_factory=list)
     review_logs: List[Dict[str, str]] = field(default_factory=list)
+    chat_logs: List[Dict[str, str]] = field(default_factory=list)
+    activity_logs: List[Dict[str, object]] = field(default_factory=list)
 
 
 class ProjectOrchestrator:
     def __init__(self) -> None:
         self._store: Dict[str, ProjectRuntime] = {}
         self._lock = Lock()
+        self._json_storage_path = (
+            Path(__file__).resolve().parents[1] / "static" / "data" / "projects_runtime.json"
+        )
+        self._db_path = (
+            Path(__file__).resolve().parents[1] / "static" / "data" / "projects_runtime.db"
+        )
+        with self._lock:
+            self._init_db_locked()
+            self._load_store_locked()
+
+    def _serialize_runtime(self, runtime: ProjectRuntime) -> Dict[str, Any]:
+        return {
+            "state": runtime.state,
+            "current_index": runtime.current_index,
+            "status": runtime.status,
+            "awaiting_review": runtime.awaiting_review,
+            "step_count": runtime.step_count,
+            "last_advanced_at": runtime.last_advanced_at,
+            "history": runtime.history,
+            "review_logs": runtime.review_logs,
+            "chat_logs": runtime.chat_logs,
+            "activity_logs": runtime.activity_logs,
+        }
+
+    def _deserialize_runtime(self, payload: Dict[str, Any]) -> Optional[ProjectRuntime]:
+        state = payload.get("state")
+        if not isinstance(state, dict):
+            return None
+        project_id = state.get("project_id")
+        if not isinstance(project_id, str) or not project_id:
+            return None
+        return ProjectRuntime(
+            state=state,
+            current_index=int(payload.get("current_index", 0)),
+            status=str(payload.get("status", "running")),
+            awaiting_review=bool(payload.get("awaiting_review", False)),
+            step_count=int(payload.get("step_count", 0)),
+            last_advanced_at=float(payload.get("last_advanced_at", 0.0)),
+            history=list(payload.get("history", [])),
+            review_logs=list(payload.get("review_logs", [])),
+            chat_logs=list(payload.get("chat_logs", [])),
+            activity_logs=list(payload.get("activity_logs", [])),
+        )
+
+    def _db_connect_locked(self) -> sqlite3.Connection:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(self._db_path))
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        return connection
+
+    def _init_db_locked(self) -> None:
+        connection = self._db_connect_locked()
+        try:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS projects_runtime (
+                    project_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _load_json_store_locked(self) -> Dict[str, ProjectRuntime]:
+        if not self._json_storage_path.exists():
+            return {}
+        try:
+            payload = json.loads(self._json_storage_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        projects = payload.get("projects") if isinstance(payload, dict) else None
+        if not isinstance(projects, dict):
+            return {}
+        loaded: Dict[str, ProjectRuntime] = {}
+        for project_id, runtime_payload in projects.items():
+            if not isinstance(project_id, str) or not isinstance(runtime_payload, dict):
+                continue
+            runtime = self._deserialize_runtime(runtime_payload)
+            if runtime is not None:
+                loaded[project_id] = runtime
+        return loaded
+
+    def _persist_store_locked(self) -> None:
+        records = [
+            (
+                project_id,
+                json.dumps(self._serialize_runtime(runtime), ensure_ascii=False),
+                time.time(),
+            )
+            for project_id, runtime in self._store.items()
+        ]
+        connection = self._db_connect_locked()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM projects_runtime")
+            if records:
+                connection.executemany(
+                    """
+                    INSERT INTO projects_runtime (project_id, payload, updated_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    records,
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _load_store_locked(self) -> None:
+        loaded: Dict[str, ProjectRuntime] = {}
+        connection = self._db_connect_locked()
+        try:
+            rows = connection.execute(
+                "SELECT project_id, payload FROM projects_runtime ORDER BY updated_at DESC"
+            ).fetchall()
+        finally:
+            connection.close()
+        for project_id, payload_text in rows:
+            try:
+                runtime_payload = json.loads(payload_text)
+            except Exception:
+                continue
+            if not isinstance(project_id, str) or not isinstance(runtime_payload, dict):
+                continue
+            runtime = self._deserialize_runtime(runtime_payload)
+            if runtime is not None:
+                loaded[project_id] = runtime
+        if not loaded:
+            loaded = self._load_json_store_locked()
+            if loaded:
+                self._store = loaded
+                self._persist_store_locked()
+                return
+        if loaded:
+            self._store = loaded
 
     def create_project(self, user_prompt: str) -> str:
         with self._lock:
             state = create_initial_state(user_prompt=user_prompt)
             runtime = ProjectRuntime(state=state)
-            runtime.history.append("project_created")
+            self._append_history(runtime, "project_created")
+            self._append_chat_log(runtime, "用户", user_prompt)
+            self._append_chat_log(runtime, "Agent", self._agent_guidance(runtime))
             self._store[state["project_id"]] = runtime
+            self._persist_store_locked()
             return state["project_id"]
 
     def get_runtime(self, project_id: str) -> Optional[ProjectRuntime]:
@@ -112,6 +244,215 @@ class ProjectOrchestrator:
         runtime.state["approval_stage"] = None
         runtime.state["pending_feedback"] = []
         runtime.awaiting_review = False
+
+    def _next_node(self, runtime: ProjectRuntime) -> Optional[str]:
+        if runtime.current_index >= len(AGENT_SEQUENCE):
+            return None
+        return AGENT_SEQUENCE[runtime.current_index][0]
+
+    def _execution_plan(self, runtime: ProjectRuntime) -> List[Dict[str, str]]:
+        plan: List[Dict[str, str]] = []
+        for index, (node, _, label) in enumerate(AGENT_SEQUENCE):
+            if runtime.status == "completed":
+                status = "completed"
+            elif runtime.awaiting_review and index == runtime.current_index:
+                status = "review"
+            elif index < runtime.current_index:
+                status = "completed"
+            elif index == runtime.current_index:
+                status = "next"
+            else:
+                status = "queued"
+            plan.append({"node": node, "label": label, "status": status})
+        return plan
+
+    def _storyboard_table(self, state: ManjuState) -> List[Dict[str, str]]:
+        script_data = state.get("script_data") or {}
+        scenes = script_data.get("scenes")
+        rows: List[Dict[str, str]] = []
+        if isinstance(scenes, list):
+            for index, scene in enumerate(scenes, start=1):
+                if not isinstance(scene, dict):
+                    continue
+                shot_no = str(scene.get("index") or index)
+                beat = str(
+                    scene.get("summary")
+                    or scene.get("beat")
+                    or scene.get("description")
+                    or f"镜头 {shot_no}"
+                )
+                visual = str(scene.get("visual") or scene.get("composition") or beat)
+                dialogue = str(scene.get("dialogue") or scene.get("voiceover") or "")
+                duration = str(scene.get("duration") or "3s")
+                rows.append(
+                    {
+                        "shotNo": shot_no,
+                        "beat": beat[:80],
+                        "visual": visual[:100],
+                        "dialogue": dialogue[:80],
+                        "duration": duration,
+                    }
+                )
+        if rows:
+            return rows
+        raw = script_data.get("raw")
+        resolved_prompt = ""
+        if isinstance(raw, dict):
+            metadata = raw.get("metadata")
+            if isinstance(metadata, dict):
+                params = metadata.get("params")
+                if isinstance(params, dict):
+                    resolved_prompt = str(params.get("resolved_prompt") or "")
+        lines = [line.strip(" -•\t") for line in resolved_prompt.splitlines() if line.strip()]
+        for index, line in enumerate(lines[:10], start=1):
+            rows.append(
+                {
+                    "shotNo": str(index),
+                    "beat": line[:80],
+                    "visual": line[:100],
+                    "dialogue": "",
+                    "duration": "3s",
+                }
+            )
+        if rows:
+            return rows
+        has_script_attempt = bool(script_data) or state.get("route_reason") == NODE_SCRIPTWRITER
+        if not has_script_attempt:
+            return rows
+        prompt = str(state.get("user_prompt") or "").strip()
+        core = prompt[:36] if prompt else "主角展开日常行动"
+        return [
+            {
+                "shotNo": "1",
+                "beat": f"开场设定：{core}",
+                "visual": "全景交代环境与人物关系",
+                "dialogue": "",
+                "duration": "4s",
+            },
+            {
+                "shotNo": "2",
+                "beat": f"动作推进：{core}",
+                "visual": "中景呈现关键动作与互动",
+                "dialogue": "",
+                "duration": "4s",
+            },
+            {
+                "shotNo": "3",
+                "beat": f"情绪特写：{core}",
+                "visual": "特写强化情绪和细节表达",
+                "dialogue": "",
+                "duration": "3s",
+            },
+        ]
+
+    def _execution_plan_summary(self, runtime: ProjectRuntime) -> str:
+        plan = self._execution_plan(runtime)
+        if runtime.status == "completed":
+            return "执行计划已全部完成。"
+        if runtime.status == "rejected":
+            return "项目已终止，当前计划不再继续。"
+        visible = [step for step in plan if step["status"] in {"review", "next", "queued"}][:3]
+        if not visible:
+            return "当前没有待执行节点。"
+        titles = " → ".join(step["label"] for step in visible)
+        return f"执行计划：{titles}"
+
+    def _suggested_commands(self, runtime: ProjectRuntime) -> List[str]:
+        if runtime.status == "completed":
+            return ["重做分镜图，镜头更有张力", "重做视频，动作更流畅", "重做角色，风格更统一"]
+        if runtime.status == "rejected":
+            return ["新建项目，输入小说文本并开始生成"]
+        if runtime.awaiting_review:
+            return ["确认风格，继续生成", "修改风格为赛博朋克霓虹", "修改风格为水墨东方"]
+        node = self._next_node(runtime)
+        if node == NODE_SCRIPTWRITER:
+            return ["开始分镜拆解", "重做分镜拆解，节奏更快", "分镜拆解偏电影感"]
+        if node == NODE_CHARACTER_DESIGNER:
+            return ["开始角色生成", "重做角色，风格更统一", "角色更年轻化，线条更干净"]
+        if node == NODE_STORYBOARD_ARTIST:
+            return ["开始分镜图生成", "重做分镜图，镜头更有冲击力", "分镜图增加近景特写"]
+        if node == NODE_ANIMATION_ARTIST:
+            return ["开始视频生成", "重做视频，动作更流畅", "视频节奏更紧凑"]
+        return ["开始下一阶段", "重做当前阶段", "按默认参数继续"]
+
+    def _target_node_options(self) -> List[Dict[str, str]]:
+        return [
+            {"node": NODE_SCRIPTWRITER, "label": "分镜拆解"},
+            {"node": NODE_CHARACTER_DESIGNER, "label": "角色设计"},
+            {"node": NODE_STORYBOARD_ARTIST, "label": "分镜图"},
+            {"node": NODE_ANIMATION_ARTIST, "label": "视频"},
+        ]
+
+    def _agent_guidance(self, runtime: ProjectRuntime) -> str:
+        plan_summary = self._execution_plan_summary(runtime)
+        suggestions = " / ".join(self._suggested_commands(runtime)[:3])
+        if runtime.status == "completed":
+            return f"成片已生成，可继续提出优化意见。{plan_summary} 建议指令：{suggestions}。"
+        if runtime.status == "rejected":
+            return f"项目已结束。{plan_summary} 建议指令：{suggestions}。"
+        if runtime.awaiting_review:
+            return (
+                f"角色风格已生成，请先确认风格再进入下一阶段。{plan_summary} "
+                f"建议指令：{suggestions}。"
+            )
+        node = self._next_node(runtime)
+        if not node:
+            return f"流程已结束，等待你下一步指令。{plan_summary}"
+        return (
+            f"下一步将执行 {NODE_LABELS.get(node, node)}。"
+            f"{plan_summary} 建议指令：{suggestions}。"
+        )
+
+    def _agent_chat_reply(self, runtime: ProjectRuntime, user_message: str) -> str:
+        stage = runtime.state.get("approval_stage") or NODE_LABELS.get(self._next_node(runtime) or "", "流程调度")
+        guidance = self._agent_guidance(runtime)
+        context = (
+            f"当前阶段：{stage}；"
+            f"项目状态：{runtime.status}；"
+            f"{guidance}"
+        )
+        return generate_chat_reply_tool(user_message=user_message, context=context, stage="scriptwriter")
+
+    def _append_chat_log(self, runtime: ProjectRuntime, role: str, message: str) -> None:
+        payload = {
+            "role": role,
+            "message": message,
+            "stage": runtime.state.get("approval_stage") or "",
+            "node": runtime.state.get("current_node") or "",
+        }
+        runtime.chat_logs.append(payload)
+        self._append_activity(runtime, "chat", payload)
+
+    def _append_review_log(self, runtime: ProjectRuntime, payload: Dict[str, str]) -> None:
+        runtime.review_logs.append(payload)
+        self._append_activity(runtime, "review", payload)
+
+    def _append_history(self, runtime: ProjectRuntime, event: str) -> None:
+        runtime.history.append(event)
+        self._append_activity(runtime, "history", {"event": event})
+
+    def _append_activity(self, runtime: ProjectRuntime, kind: str, payload: Dict[str, object]) -> None:
+        runtime.activity_logs.append(
+            {
+                "index": len(runtime.activity_logs),
+                "kind": kind,
+                "payload": payload,
+            }
+        )
+
+    def _infer_target_node(self, message: str) -> Optional[str]:
+        text = message.lower()
+        if "拆解" in message or "小说" in message or "script" in text:
+            return NODE_SCRIPTWRITER
+        if "角色" in message or "character" in text:
+            return NODE_CHARACTER_DESIGNER
+        if "分镜图" in message or "storyboard image" in text:
+            return NODE_STORYBOARD_ARTIST
+        if "分镜" in message or "storyboard" in text:
+            return NODE_SCRIPTWRITER
+        if "视频" in message or "动画" in message or "animation" in text or "video" in text:
+            return NODE_ANIMATION_ARTIST
+        return None
 
     def submit_review(
         self,
@@ -133,7 +474,8 @@ class ProjectOrchestrator:
                 self._mark_approval_resolved(runtime)
                 runtime.current_index = min(runtime.current_index + 1, len(AGENT_SEQUENCE))
                 runtime.status = "running"
-                runtime.review_logs.append(
+                self._append_review_log(
+                    runtime,
                     {
                         "action": "approve",
                         "operator_id": operator_id,
@@ -141,16 +483,17 @@ class ProjectOrchestrator:
                         "issue_type": issue_type or "manual_review",
                         "priority": priority,
                         "message": message or "",
-                    }
+                    },
                 )
-                runtime.history.append("review_approved")
+                self._append_history(runtime, "review_approved")
             elif action == "revise":
                 if not target_node or target_node not in STAGE_TO_INDEX:
                     raise ValueError("invalid_target_node")
                 runtime.current_index = STAGE_TO_INDEX[target_node]
                 self._mark_approval_resolved(runtime)
                 runtime.status = "running"
-                runtime.review_logs.append(
+                self._append_review_log(
+                    runtime,
                     {
                         "action": "revise",
                         "operator_id": operator_id,
@@ -159,15 +502,16 @@ class ProjectOrchestrator:
                         "priority": priority,
                         "message": message or "",
                         "target_node": target_node,
-                    }
+                    },
                 )
-                runtime.history.append(f"review_revise:{target_node}")
+                self._append_history(runtime, f"review_revise:{target_node}")
             elif action == "reject":
                 runtime.status = "rejected"
                 runtime.awaiting_review = False
                 runtime.state["approval_required"] = False
                 runtime.state["approval_stage"] = None
-                runtime.review_logs.append(
+                self._append_review_log(
+                    runtime,
                     {
                         "action": "reject",
                         "operator_id": operator_id,
@@ -175,14 +519,147 @@ class ProjectOrchestrator:
                         "issue_type": issue_type or "manual_reject",
                         "priority": priority,
                         "message": message or "rejected_by_user",
-                    }
+                    },
                 )
                 runtime.state["errors"].append(
                     {"node": "Director_Agent", "error": message or "rejected_by_user"}
                 )
-                runtime.history.append("review_rejected")
+                self._append_history(runtime, "review_rejected")
             else:
                 raise ValueError("invalid_action")
+            self._persist_store_locked()
+            return runtime
+
+    def chat_and_operate(self, project_id: str, message: str, operator_id: str = "anonymous") -> ProjectRuntime:
+        text = (message or "").strip()
+        if not text:
+            raise ValueError("empty_message")
+        with self._lock:
+            runtime = self._store.get(project_id)
+            if runtime is None:
+                raise KeyError(project_id)
+            self._append_chat_log(runtime, operator_id, text)
+            if any(keyword in text for keyword in ["放弃项目", "终止项目"]):
+                runtime.status = "rejected"
+                runtime.awaiting_review = False
+                runtime.state["approval_required"] = False
+                runtime.state["approval_stage"] = None
+                self._append_review_log(
+                    runtime,
+                    {
+                        "action": "reject",
+                        "operator_id": operator_id,
+                        "stage": runtime.state.get("approval_stage") or "",
+                        "issue_type": "chat_reject",
+                        "priority": "high",
+                        "message": text,
+                    },
+                )
+                runtime.state["errors"].append({"node": "Director_Agent", "error": text})
+                self._append_history(runtime, "chat_rejected")
+            elif (
+                not runtime.awaiting_review
+                and runtime.current_index == STAGE_TO_INDEX[NODE_SCRIPTWRITER]
+                and not any(keyword in text for keyword in ["开始", "继续", "确认", "通过", "重做", "返修", "修改"])
+            ):
+                runtime.state["user_prompt"] = text
+                runtime.state["script_data"] = {}
+                runtime.state["character_assets"] = {}
+                runtime.state["storyboard_frames"] = []
+                runtime.state["video_clips"] = []
+                runtime.state["audio_tracks"] = {}
+                runtime.state["final_video"] = None
+                runtime.state["errors"] = []
+                runtime.current_index = STAGE_TO_INDEX[NODE_SCRIPTWRITER]
+                runtime.status = "running"
+                runtime.awaiting_review = False
+                runtime.state["approval_required"] = False
+                runtime.state["approval_stage"] = None
+                self._append_history(runtime, "chat_update_prompt")
+            elif (
+                not runtime.awaiting_review
+                and runtime.current_index == STAGE_TO_INDEX[NODE_CHARACTER_DESIGNER]
+                and any(keyword in text for keyword in ["电影感", "镜头", "运镜", "构图", "节奏", "分镜"])
+            ):
+                runtime.state["global_style"]["script_feedback"] = text
+                runtime.current_index = STAGE_TO_INDEX[NODE_SCRIPTWRITER]
+                self._mark_approval_resolved(runtime)
+                runtime.status = "running"
+                self._append_review_log(
+                    runtime,
+                    {
+                        "action": "revise",
+                        "operator_id": operator_id,
+                        "stage": "script",
+                        "issue_type": "chat_script_feedback",
+                        "priority": "high",
+                        "message": text,
+                        "target_node": NODE_SCRIPTWRITER,
+                    },
+                )
+                self._append_history(runtime, "chat_revise_script")
+            elif runtime.awaiting_review and any(
+                keyword in text for keyword in ["确认风格", "确认", "通过", "继续"]
+            ):
+                resolved_stage = runtime.state.get("approval_stage") or ""
+                self._mark_approval_resolved(runtime)
+                runtime.current_index = min(runtime.current_index + 1, len(AGENT_SEQUENCE))
+                runtime.status = "running"
+                self._append_review_log(
+                    runtime,
+                    {
+                        "action": "approve",
+                        "operator_id": operator_id,
+                        "stage": resolved_stage,
+                        "issue_type": "chat_review",
+                        "priority": "medium",
+                        "message": text,
+                    },
+                )
+                self._append_history(runtime, "chat_approved")
+            elif runtime.awaiting_review and any(
+                keyword in text for keyword in ["修改风格", "风格", "改成", "换成"]
+            ):
+                runtime.state["global_style"]["user_feedback"] = text
+                runtime.current_index = STAGE_TO_INDEX[NODE_CHARACTER_DESIGNER]
+                self._mark_approval_resolved(runtime)
+                runtime.status = "running"
+                self._append_review_log(
+                    runtime,
+                    {
+                        "action": "revise",
+                        "operator_id": operator_id,
+                        "stage": "style",
+                        "issue_type": "chat_style_feedback",
+                        "priority": "high",
+                        "message": text,
+                        "target_node": NODE_CHARACTER_DESIGNER,
+                    },
+                )
+                self._append_history(runtime, "chat_revise_style")
+            elif any(keyword in text for keyword in ["重做", "返修", "修改"]):
+                target = self._infer_target_node(text) or self._next_node(runtime) or NODE_STORYBOARD_ARTIST
+                runtime.current_index = STAGE_TO_INDEX[target]
+                self._mark_approval_resolved(runtime)
+                runtime.status = "running"
+                self._append_review_log(
+                    runtime,
+                    {
+                        "action": "revise",
+                        "operator_id": operator_id,
+                        "stage": runtime.state.get("approval_stage") or "",
+                        "issue_type": "chat_feedback",
+                        "priority": "high",
+                        "message": text,
+                        "target_node": target,
+                    },
+                )
+                self._append_history(runtime, f"chat_revise:{target}")
+            elif runtime.status not in {"completed", "rejected", "failed"}:
+                runtime.status = "running"
+            assistant_message = self._agent_chat_reply(runtime, text)
+            self._append_chat_log(runtime, "Agent", assistant_message)
+            self._persist_store_locked()
             return runtime
 
     def advance(self, project_id: str, force: bool = False) -> ProjectRuntime:
@@ -191,20 +668,31 @@ class ProjectOrchestrator:
             if runtime is None:
                 raise KeyError(project_id)
             if runtime.status in {"completed", "rejected", "failed"}:
+                self._persist_store_locked()
                 return runtime
             now = time.time()
             if not force and now - runtime.last_advanced_at < 1.2:
+                self._persist_store_locked()
                 return runtime
             runtime.last_advanced_at = now
             if runtime.awaiting_review:
+                self._persist_store_locked()
                 return runtime
             if runtime.current_index >= len(AGENT_SEQUENCE):
                 runtime.status = "completed"
+                self._persist_store_locked()
                 return runtime
             node_name, handler, _ = AGENT_SEQUENCE[runtime.current_index]
-            runtime.state = handler(runtime.state)
+            try:
+                runtime.state = handler(runtime.state)
+            except Exception as exc:
+                runtime.status = "failed"
+                runtime.awaiting_review = False
+                runtime.state["errors"].append({"node": node_name, "error": str(exc)})
+                self._persist_store_locked()
+                return runtime
             runtime.step_count += 1
-            runtime.history.append(node_name)
+            self._append_history(runtime, node_name)
             runtime.state["cost_usage"][node_name] = runtime.state["cost_usage"].get(
                 node_name, 0.0
             ) + NODE_COST[node_name]
@@ -213,7 +701,7 @@ class ProjectOrchestrator:
                 runtime.status = "waiting_review"
             else:
                 runtime.current_index += 1
-            if node_name == NODE_COMPOSITOR and runtime.state.get("final_video"):
+            if node_name == NODE_ANIMATION_ARTIST and runtime.state.get("final_video"):
                 runtime.current_index = len(AGENT_SEQUENCE)
                 runtime.status = "completed"
                 runtime.awaiting_review = False
@@ -222,6 +710,7 @@ class ProjectOrchestrator:
                 runtime.state["errors"].append(
                     {"node": "Director_Agent", "error": "max_iterations_exceeded"}
                 )
+            self._persist_store_locked()
             return runtime
 
     def snapshot(self, project_id: str) -> Dict[str, object]:
@@ -231,8 +720,8 @@ class ProjectOrchestrator:
                 raise KeyError(project_id)
             state = runtime.state
             current_node = state.get("current_node") or AGENT_SEQUENCE[0][0]
-            current_stage_name = "Queued"
-            if runtime.current_index < len(AGENT_SEQUENCE):
+            current_stage_name = "已完成" if runtime.status == "completed" else "Queued"
+            if runtime.status != "completed" and runtime.current_index < len(AGENT_SEQUENCE):
                 current_stage_name = AGENT_SEQUENCE[runtime.current_index][2]
             if runtime.awaiting_review and state.get("approval_stage"):
                 current_stage_name = f"{state['approval_stage'].title()} Review"
@@ -292,6 +781,8 @@ class ProjectOrchestrator:
                 "storyboards": storyboard_gallery,
                 "videos": video_gallery,
             }
+            execution_plan = self._execution_plan(runtime)
+            suggested_commands = self._suggested_commands(runtime)
             return {
                 "projectId": state["project_id"],
                 "prompt": state["user_prompt"],
@@ -310,9 +801,16 @@ class ProjectOrchestrator:
                 ),
                 "assets": assets,
                 "assetGallery": asset_gallery,
+                "storyboardTable": self._storyboard_table(state),
                 "nodeMetrics": node_metrics,
                 "latestReview": runtime.review_logs[-1] if runtime.review_logs else None,
                 "reviewLogs": list(runtime.review_logs),
+                "chatLogs": list(runtime.chat_logs),
+                "activityLogs": list(runtime.activity_logs),
+                "executionPlan": execution_plan,
+                "executionPlanSummary": self._execution_plan_summary(runtime),
+                "suggestedCommands": suggested_commands,
+                "targetNodeOptions": self._target_node_options(),
                 "history": list(runtime.history),
                 "errors": list(state["errors"]),
             }

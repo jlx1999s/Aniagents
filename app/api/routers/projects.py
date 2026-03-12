@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.schemas.project import (
+    ChatRequest,
     CreateProjectRequest,
     CreateProjectResponse,
     ProjectSnapshot,
@@ -15,6 +16,37 @@ from app.services.orchestrator import orchestrator
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
+def _should_advance_from_chat(message: str) -> bool:
+    text = (message or "").strip()
+    if not text:
+        return False
+    keywords = [
+        "开始下一阶段",
+        "开始分镜拆解",
+        "开始角色生成",
+        "开始分镜图生成",
+        "开始视频生成",
+        "执行当前阶段",
+        "确认风格",
+        "通过",
+        "继续",
+        "重做",
+        "返修",
+        "修改风格",
+    ]
+    return any(keyword in text for keyword in keywords)
+
+
+def _should_auto_advance_after_prompt_update(runtime) -> bool:
+    if runtime.awaiting_review:
+        return False
+    if runtime.current_index != 0:
+        return False
+    if not runtime.history:
+        return False
+    return runtime.history[-1] in {"chat_update_prompt", "chat_revise_script"}
+
+
 @router.get("", response_model=List[str])
 def list_projects() -> List[str]:
     return orchestrator.list_project_ids()
@@ -23,7 +55,6 @@ def list_projects() -> List[str]:
 @router.post("", response_model=CreateProjectResponse)
 def create_project(payload: CreateProjectRequest) -> CreateProjectResponse:
     project_id = orchestrator.create_project(payload.user_prompt)
-    orchestrator.advance(project_id, force=True)
     return CreateProjectResponse(project_id=project_id)
 
 
@@ -65,6 +96,23 @@ def advance_project(project_id: str) -> ProjectSnapshot:
         raise HTTPException(status_code=404, detail="project_not_found") from exc
 
 
+@router.post("/{project_id}/chat", response_model=ProjectSnapshot)
+def chat_project(project_id: str, payload: ChatRequest) -> ProjectSnapshot:
+    try:
+        runtime = orchestrator.chat_and_operate(
+            project_id=project_id,
+            message=payload.message,
+            operator_id=payload.operator_id or "anonymous",
+        )
+        if _should_advance_from_chat(payload.message) or _should_auto_advance_after_prompt_update(runtime):
+            orchestrator.advance(project_id, force=True)
+        return ProjectSnapshot(**orchestrator.snapshot(project_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project_not_found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/{project_id}/stream")
 async def stream_project(project_id: str, request: Request) -> StreamingResponse:
     try:
@@ -76,7 +124,6 @@ async def stream_project(project_id: str, request: Request) -> StreamingResponse
         while True:
             if await request.is_disconnected():
                 break
-            orchestrator.advance(project_id)
             yield orchestrator.sse_event(project_id)
             await asyncio.sleep(1.0)
 

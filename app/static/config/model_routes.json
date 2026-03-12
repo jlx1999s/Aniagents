@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "updatedAt": "2026-03-12T13:56:27.408Z",
+  "defaults": {
+    "provider": "vectorengine",
+    "baseUrl": "https://api.vectorengine.ai"
+  },
+  "routes": {
+    "scriptwriter": {
+      "script": {
+        "provider": "vectorengine",
+        "baseUrl": "https://api.vectorengine.ai",
+        "model": "gemini-3.1-flash-lite-preview",
+        "enabled": true,
+        "params": {}
+      }
+    },
+    "art-director": {
+      "style": {
+        "provider": "vectorengine",
+        "baseUrl": "https://api.vectorengine.ai",
+        "model": "style-mock",
+        "enabled": true,
+        "params": {}
+      }
+    },
+    "character": {
+      "image": {
+        "provider": "vectorengine",
+        "baseUrl": "https://api.vectorengine.ai",
+        "model": "llava",
+        "enabled": true,
+        "params": {
+          "temperature": 0.2
+        }
+      }
+    },
+    "storyboard": {
+      "image": {
+        "provider": "vectorengine",
+        "baseUrl": "https://api.vectorengine.ai",
+        "model": "image-mock",
+        "enabled": true,
+        "params": {}
+      }
+    },
+    "animation": {
+      "video": {
+        "provider": "vectorengine",
+        "baseUrl": "https://api.vectorengine.ai",
+        "model": "video-mock",
+        "enabled": true,
+        "params": {}
+      }
+    },
+    "sound": {
+      "tts": {
+        "provider": "vectorengine",
+        "baseUrl": "https://api.vectorengine.ai",
+        "model": "tts-mock",
+        "enabled": true,
+        "params": {}
+      },
+      "bgm": {
+        "provider": "vectorengine",
+        "baseUrl": "https://api.vectorengine.ai",
+        "model": "bgm-mock",
+        "enabled": true,
+        "params": {}
+      }
+    },
+    "compositor": {
+      "compose": {
+        "provider": "vectorengine",
+        "baseUrl": "https://api.vectorengine.ai",
+        "model": "compose-mock",
+        "enabled": true,
+        "params": {}
+      }
+    },
+    "qa": {
+      "qa": {
+        "provider": "vectorengine",
+        "baseUrl": "https://api.vectorengine.ai",
+        "model": "qa-mock",
+        "enabled": true,
+        "params": {}
+      }
+    }
+  }
+}

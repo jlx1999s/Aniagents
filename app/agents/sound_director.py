@@ -5,8 +5,8 @@ from app.tools.mcp_client import generate_bgm_tool, synthesize_tts_tool
 
 
 def sound_director_agent(state: ManjuState) -> ManjuState:
-    tts_result = synthesize_tts_tool(text="placeholder narration")
-    bgm_result = generate_bgm_tool(style="cinematic")
+    tts_result = synthesize_tts_tool(text="placeholder narration", stage="sound")
+    bgm_result = generate_bgm_tool(style="cinematic", stage="sound")
     tts_asset = create_asset_meta(
         uri=tts_result["result_uri"],
         model_name=tts_result["metadata"]["model_name"],

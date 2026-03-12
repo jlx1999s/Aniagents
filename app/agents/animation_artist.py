@@ -8,7 +8,7 @@ def animation_artist_agent(state: ManjuState) -> ManjuState:
     ref_uri = None
     if state["storyboard_frames"]:
         ref_uri = state["storyboard_frames"][0]["uri"]
-    result = generate_video_tool(prompt=state["user_prompt"], ref_uri=ref_uri)
+    result = generate_video_tool(prompt=state["user_prompt"], ref_uri=ref_uri, stage="animation")
     clip = create_asset_meta(
         uri=result["result_uri"],
         model_name=result["metadata"]["model_name"],
@@ -17,6 +17,7 @@ def animation_artist_agent(state: ManjuState) -> ManjuState:
         qa_score=None,
     )
     state["video_clips"] = [clip]
+    state["final_video"] = clip
     state["current_node"] = NODE_ANIMATION_ARTIST
     state["route_reason"] = NODE_ANIMATION_ARTIST
     return state
