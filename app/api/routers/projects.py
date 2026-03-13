@@ -5,9 +5,12 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.schemas.project import (
+    BatchDeleteProjectsRequest,
+    BatchDeleteProjectsResponse,
     ChatRequest,
     CreateProjectRequest,
     CreateProjectResponse,
+    ProjectStatsResponse,
     ProjectSnapshot,
     ReviewRequest,
 )
@@ -52,10 +55,29 @@ def list_projects() -> List[str]:
     return orchestrator.list_project_ids()
 
 
+@router.get("/stats", response_model=ProjectStatsResponse)
+def get_project_stats() -> ProjectStatsResponse:
+    return ProjectStatsResponse(**orchestrator.project_stats())
+
+
 @router.post("", response_model=CreateProjectResponse)
 def create_project(payload: CreateProjectRequest) -> CreateProjectResponse:
     project_id = orchestrator.create_project(payload.user_prompt)
     return CreateProjectResponse(project_id=project_id)
+
+
+@router.post("/delete-batch", response_model=BatchDeleteProjectsResponse)
+def delete_projects(payload: BatchDeleteProjectsRequest) -> BatchDeleteProjectsResponse:
+    normalized_ids = []
+    seen = set()
+    for project_id in payload.project_ids:
+        value = (project_id or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized_ids.append(value)
+    deleted_count = orchestrator.delete_projects(normalized_ids)
+    return BatchDeleteProjectsResponse(deleted_count=deleted_count)
 
 
 @router.get("/{project_id}", response_model=ProjectSnapshot)
@@ -64,6 +86,14 @@ def get_project(project_id: str) -> ProjectSnapshot:
         return ProjectSnapshot(**orchestrator.snapshot(project_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project_not_found") from exc
+
+
+@router.delete("/{project_id}")
+def delete_project(project_id: str) -> dict:
+    deleted = orchestrator.delete_project(project_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    return {"ok": True}
 
 
 @router.post("/{project_id}/review", response_model=ProjectSnapshot)

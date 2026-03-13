@@ -11,6 +11,23 @@ class CreateProjectResponse(BaseModel):
     project_id: str
 
 
+class ProjectStatsResponse(BaseModel):
+    total: int
+    running: int
+    waiting_review: int
+    completed: int
+    rejected: int
+    failed: int
+
+
+class BatchDeleteProjectsRequest(BaseModel):
+    project_ids: List[str]
+
+
+class BatchDeleteProjectsResponse(BaseModel):
+    deleted_count: int
+
+
 class ReviewRequest(BaseModel):
     action: Literal["approve", "revise", "reject"]
     target_node: Optional[str] = None

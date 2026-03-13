@@ -252,6 +252,47 @@ class ProjectOrchestrator:
         with self._lock:
             return list(self._store.keys())
 
+    def project_stats(self) -> Dict[str, int]:
+        with self._lock:
+            status_counts = {
+                "running": 0,
+                "waiting_review": 0,
+                "completed": 0,
+                "rejected": 0,
+                "failed": 0,
+            }
+            for runtime in self._store.values():
+                status = runtime.status
+                if status in status_counts:
+                    status_counts[status] += 1
+            return {
+                "total": len(self._store),
+                "running": status_counts["running"],
+                "waiting_review": status_counts["waiting_review"],
+                "completed": status_counts["completed"],
+                "rejected": status_counts["rejected"],
+                "failed": status_counts["failed"],
+            }
+
+    def delete_project(self, project_id: str) -> bool:
+        with self._lock:
+            if project_id not in self._store:
+                return False
+            del self._store[project_id]
+            self._persist_store_locked()
+            return True
+
+    def delete_projects(self, project_ids: List[str]) -> int:
+        with self._lock:
+            deleted_count = 0
+            for project_id in project_ids:
+                if project_id in self._store:
+                    del self._store[project_id]
+                    deleted_count += 1
+            if deleted_count > 0:
+                self._persist_store_locked()
+            return deleted_count
+
     def _mark_approval_resolved(self, runtime: ProjectRuntime) -> None:
         runtime.state["approval_required"] = False
         runtime.state["approval_stage"] = None
