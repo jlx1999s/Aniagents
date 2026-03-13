@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from app.agents.animation_artist import animation_artist_agent
 from app.agents.character_designer import character_designer_agent
@@ -56,6 +56,33 @@ NODE_ACTORS = {
     NODE_ANIMATION_ARTIST: "动画师",
 }
 
+MAX_REVIEW_LOGS = 120
+MAX_CHAT_LOGS = 240
+MAX_ACTIVITY_LOGS = 320
+MAX_INTENT_LOGS = 120
+MAX_HISTORY_EVENTS = 300
+MAX_ROUND_HISTORY = 40
+
+AGENT_ALLOWED_STATE_WRITES: Dict[str, Set[str]] = {
+    NODE_SCRIPTWRITER: {"script_data", "script_history", "current_node", "route_reason"},
+    NODE_CHARACTER_DESIGNER: {
+        "global_style",
+        "character_assets",
+        "approval_required",
+        "approval_stage",
+        "current_node",
+        "route_reason",
+    },
+    NODE_STORYBOARD_ARTIST: {
+        "storyboard_frames",
+        "approval_required",
+        "approval_stage",
+        "current_node",
+        "route_reason",
+    },
+    NODE_ANIMATION_ARTIST: {"video_clips", "final_video", "current_node", "route_reason"},
+}
+
 
 def _build_asset_preview(asset: Dict[str, object], kind: str) -> Dict[str, object]:
     source_uri = str(asset.get("uri") or "")
@@ -88,6 +115,12 @@ class ProjectRuntime:
     activity_logs: List[Dict[str, object]] = field(default_factory=list)
     conversation_round: int = 1
     round_history: List[Dict[str, object]] = field(default_factory=list)
+    snapshot_cache_version: int = 0
+    snapshot_cache_payload: Optional[Dict[str, object]] = None
+    compact_snapshot_cache_version: int = 0
+    compact_snapshot_cache_payload: Optional[Dict[str, object]] = None
+    sse_cache_version: int = 0
+    sse_cache_payload: str = ""
 
 
 class ProjectOrchestrator:
@@ -153,6 +186,7 @@ class ProjectOrchestrator:
         project_id = state.get("project_id")
         if not isinstance(project_id, str) or not project_id:
             return None
+        self._ensure_state_defaults(state)
         return ProjectRuntime(
             state=state,
             current_index=int(payload.get("current_index", 0)),
@@ -167,6 +201,14 @@ class ProjectOrchestrator:
             conversation_round=max(1, int(payload.get("conversation_round", 1))),
             round_history=list(payload.get("round_history", [])),
         )
+
+    def _ensure_state_defaults(self, state: Dict[str, Any]) -> None:
+        state.setdefault("script_history", [])
+        state.setdefault("version", 1)
+        state.setdefault("timing_ms", {})
+        state.setdefault("timing_last_ms", {})
+        state.setdefault("cost_usage", {})
+        state.setdefault("errors", [])
 
     def _db_connect_locked(self) -> sqlite3.Connection:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -267,10 +309,16 @@ class ProjectOrchestrator:
         with self._lock:
             state = create_initial_state(user_prompt=user_prompt)
             runtime = ProjectRuntime(state=state)
+            self._ensure_state_defaults(runtime.state)
             runtime.state["intent_router_policy"] = normalize_intent_router_policy(get_intent_router_policy())
             self._append_history(runtime, "project_created")
             self._append_chat_log(runtime, "用户", user_prompt)
             self._append_chat_log(runtime, "Agent", self._agent_guidance(runtime))
+            self._append_state_event(
+                runtime,
+                "project_initialized",
+                {"prompt": user_prompt, "projectId": state["project_id"]},
+            )
             self._store[state["project_id"]] = runtime
             self._persist_store_locked()
             return state["project_id"]
@@ -293,6 +341,7 @@ class ProjectOrchestrator:
             runtime = self._store.get(project_id)
             if runtime is None:
                 raise KeyError(project_id)
+            self._ensure_state_defaults(runtime.state)
             existing = self._runtime_intent_router_policy(runtime)
             merged = {**existing, **(payload if isinstance(payload, dict) else {})}
             merged_rules = dict(existing.get("rules", {}))
@@ -302,6 +351,8 @@ class ProjectOrchestrator:
             merged["rules"] = merged_rules
             normalized = normalize_intent_router_policy(merged)
             runtime.state["intent_router_policy"] = normalized
+            self._append_state_event(runtime, "intent_router_policy_updated", {"policy": normalized})
+            self._bump_state_version(runtime, "intent_policy_update")
             self._persist_store_locked()
             return json.loads(json.dumps(normalized))
 
@@ -480,6 +531,93 @@ class ProjectOrchestrator:
                 "duration": "3s",
             },
         ]
+
+    def _storyboard_table_from_events(self, runtime: ProjectRuntime, state: ManjuState) -> List[Dict[str, str]]:
+        rows: List[Dict[str, str]] = []
+        shot_no = 1
+        for item in runtime.activity_logs:
+            if item.get("kind") != "state_event":
+                continue
+            payload = item.get("payload")
+            if not isinstance(payload, dict) or payload.get("event") != "script_generated":
+                continue
+            details = payload.get("payload")
+            if not isinstance(details, dict):
+                continue
+            scenes = details.get("scenes")
+            if not isinstance(scenes, list):
+                continue
+            for scene in scenes:
+                if not isinstance(scene, dict):
+                    continue
+                beat = str(scene.get("summary") or scene.get("beat") or scene.get("description") or f"镜头 {shot_no}")
+                visual = str(scene.get("visual") or scene.get("composition") or beat)
+                dialogue = str(scene.get("dialogue") or scene.get("voiceover") or "")
+                duration = str(scene.get("duration") or "3s")
+                rows.append(
+                    {
+                        "shotNo": str(shot_no),
+                        "beat": beat[:80],
+                        "visual": visual[:100],
+                        "dialogue": dialogue[:80],
+                        "duration": duration,
+                    }
+                )
+                shot_no += 1
+        if rows:
+            return rows
+        return self._storyboard_table(state)
+
+    def _asset_gallery_from_events(
+        self, runtime: ProjectRuntime, state: ManjuState
+    ) -> Dict[str, List[Dict[str, object]]]:
+        characters: List[Dict[str, object]] = []
+        storyboards: List[Dict[str, object]] = []
+        videos: List[Dict[str, object]] = []
+        for item in runtime.activity_logs:
+            if item.get("kind") != "state_event":
+                continue
+            payload = item.get("payload")
+            if not isinstance(payload, dict) or payload.get("event") != "asset_added":
+                continue
+            details = payload.get("payload")
+            if not isinstance(details, dict):
+                continue
+            asset_type = details.get("assetType")
+            asset = details.get("asset")
+            if not isinstance(asset, dict):
+                continue
+            if asset_type == "character":
+                characters.append(_build_asset_preview(asset, "character"))
+            elif asset_type == "storyboard":
+                storyboards.append(_build_asset_preview(asset, "storyboard"))
+            elif asset_type == "video":
+                videos.append(_build_asset_preview(asset, "video"))
+        if characters or storyboards or videos:
+            return {
+                "characters": characters,
+                "storyboards": storyboards,
+                "videos": videos,
+            }
+        character_gallery = [
+            _build_asset_preview(asset, "character")
+            for asset in state.get("character_assets", {}).values()
+        ]
+        storyboard_gallery = [
+            _build_asset_preview(asset, "storyboard")
+            for asset in state.get("storyboard_frames", [])
+        ]
+        video_gallery = [
+            _build_asset_preview(asset, "video")
+            for asset in state.get("video_clips", [])
+        ]
+        if state.get("final_video"):
+            video_gallery.append(_build_asset_preview(state["final_video"], "video"))
+        return {
+            "characters": character_gallery,
+            "storyboards": storyboard_gallery,
+            "videos": video_gallery,
+        }
 
     def _execution_plan_summary(self, runtime: ProjectRuntime) -> str:
         plan = self._execution_plan(runtime)
@@ -691,6 +829,7 @@ class ProjectOrchestrator:
     def _append_review_log(self, runtime: ProjectRuntime, payload: Dict[str, str]) -> None:
         runtime.review_logs.append(payload)
         self._append_activity(runtime, "review", payload)
+        self._append_state_event(runtime, "review_action", dict(payload))
 
     def _append_history(self, runtime: ProjectRuntime, event: str, actor: Optional[str] = None) -> None:
         runtime.history.append(event)
@@ -707,6 +846,94 @@ class ProjectOrchestrator:
                 "payload": payload,
             }
         )
+
+    def _state_version(self, runtime: ProjectRuntime) -> int:
+        current = runtime.state.get("version")
+        if isinstance(current, int) and current > 0:
+            return current
+        runtime.state["version"] = 1
+        return 1
+
+    def _append_state_event(self, runtime: ProjectRuntime, event: str, payload: Dict[str, Any]) -> None:
+        self._append_activity(
+            runtime,
+            "state_event",
+            {
+                "event": event,
+                "stateVersion": self._state_version(runtime),
+                "payload": payload,
+            },
+        )
+
+    def _bump_state_version(self, runtime: ProjectRuntime, reason: str, metadata: Optional[Dict[str, Any]] = None) -> int:
+        next_version = self._state_version(runtime) + 1
+        runtime.state["version"] = next_version
+        payload: Dict[str, Any] = {"reason": reason}
+        if isinstance(metadata, dict):
+            payload["metadata"] = metadata
+        self._append_state_event(runtime, "state_version_bump", payload)
+        return next_version
+
+    def _append_execution_state_events(
+        self,
+        runtime: ProjectRuntime,
+        node_name: str,
+        before_state: Dict[str, Any],
+        after_state: Dict[str, Any],
+    ) -> None:
+        before_script_len = len(before_state.get("script_history") or [])
+        after_script_history = after_state.get("script_history") or []
+        if len(after_script_history) > before_script_len:
+            latest_script = after_script_history[-1]
+            if isinstance(latest_script, dict):
+                self._append_state_event(
+                    runtime,
+                    "script_generated",
+                    {
+                        "node": node_name,
+                        "prompt": latest_script.get("prompt") or after_state.get("user_prompt", ""),
+                        "scenes": latest_script.get("scenes") or [],
+                    },
+                )
+
+        before_character = before_state.get("character_assets") or {}
+        after_character = after_state.get("character_assets") or {}
+        if isinstance(before_character, dict) and isinstance(after_character, dict):
+            for key, asset in after_character.items():
+                if key in before_character:
+                    continue
+                self._append_state_event(
+                    runtime,
+                    "asset_added",
+                    {"node": node_name, "assetType": "character", "assetKey": key, "asset": asset},
+                )
+
+        before_storyboards = before_state.get("storyboard_frames") or []
+        after_storyboards = after_state.get("storyboard_frames") or []
+        if isinstance(before_storyboards, list) and isinstance(after_storyboards, list):
+            for frame in after_storyboards[len(before_storyboards) :]:
+                self._append_state_event(
+                    runtime,
+                    "asset_added",
+                    {"node": node_name, "assetType": "storyboard", "asset": frame},
+                )
+
+        before_videos = before_state.get("video_clips") or []
+        after_videos = after_state.get("video_clips") or []
+        if isinstance(before_videos, list) and isinstance(after_videos, list):
+            for clip in after_videos[len(before_videos) :]:
+                self._append_state_event(
+                    runtime,
+                    "asset_added",
+                    {"node": node_name, "assetType": "video", "asset": clip},
+                )
+        final_video = after_state.get("final_video")
+        if final_video and final_video != before_state.get("final_video"):
+            self._append_state_event(
+                runtime,
+                "final_video_updated",
+                {"node": node_name, "asset": final_video},
+            )
 
     def _infer_target_node(self, message: str) -> Optional[str]:
         text = message.lower()
@@ -940,6 +1167,7 @@ class ProjectOrchestrator:
         )
 
     def _start_new_creation_cycle(self, runtime: ProjectRuntime, prompt: str, operator_id: str) -> None:
+        self._ensure_state_defaults(runtime.state)
         previous_round_record = {
             "round": runtime.conversation_round,
             "prompt": runtime.state.get("user_prompt", ""),
@@ -975,6 +1203,11 @@ class ProjectOrchestrator:
                 "target_node": NODE_SCRIPTWRITER,
             },
         )
+        self._append_state_event(
+            runtime,
+            "creation_cycle_started",
+            {"round": runtime.conversation_round, "prompt": prompt, "operator": operator_id},
+        )
         self._append_history(runtime, "chat_new_cycle_started")
 
     def submit_review(
@@ -992,6 +1225,7 @@ class ProjectOrchestrator:
             runtime = self._store.get(project_id)
             if runtime is None:
                 raise KeyError(project_id)
+            self._ensure_state_defaults(runtime.state)
             if action in {"approve", "revise", "reject"} and not runtime.awaiting_review:
                 raise ValueError("review_not_required")
             if action == "approve":
@@ -1052,6 +1286,7 @@ class ProjectOrchestrator:
                 self._append_history(runtime, "review_rejected")
             else:
                 raise ValueError("invalid_action")
+            self._bump_state_version(runtime, "submit_review", {"action": action})
             self._persist_store_locked()
             return runtime
 
@@ -1063,6 +1298,7 @@ class ProjectOrchestrator:
             runtime = self._store.get(project_id)
             if runtime is None:
                 raise KeyError(project_id)
+            self._ensure_state_defaults(runtime.state)
             assistant_target_node: Optional[str] = None
             director_dispatch_required = False
             self._append_chat_log(runtime, operator_id, text)
@@ -1218,6 +1454,7 @@ class ProjectOrchestrator:
             else:
                 assistant_message = self._agent_chat_reply(runtime, text)
                 self._append_chat_log(runtime, "导演", assistant_message)
+            self._bump_state_version(runtime, "chat_and_operate", {"intent": intent})
             self._persist_store_locked()
             return runtime
 
@@ -1226,10 +1463,12 @@ class ProjectOrchestrator:
         node_name: Optional[str] = None
         handler = None
         execute_state: Optional[ManjuState] = None
+        execute_base_version: Optional[int] = None
         with self._lock:
             runtime = self._store.get(project_id)
             if runtime is None:
                 raise KeyError(project_id)
+            self._ensure_state_defaults(runtime.state)
             if runtime.status in {"completed", "rejected", "failed"}:
                 self._persist_store_locked()
                 return runtime
@@ -1281,6 +1520,11 @@ class ProjectOrchestrator:
             runtime.awaiting_review = False
             runtime.status = "running"
             runtime.state["current_node"] = node_name
+            execute_base_version = self._bump_state_version(
+                runtime,
+                "advance_dispatch",
+                {"node": node_name, "index": selected_index},
+            )
             execute_state = deepcopy(runtime.state)
             self._persist_store_locked()
         try:
@@ -1289,6 +1533,7 @@ class ProjectOrchestrator:
                 node_name=node_name,
                 handler=handler,
                 state=execute_state,
+                allowed_write_fields=AGENT_ALLOWED_STATE_WRITES.get(node_name, set()),
             )
             elapsed_ms = int((time.perf_counter() - execute_started_at) * 1000)
         except Exception as exc:
@@ -1296,16 +1541,44 @@ class ProjectOrchestrator:
                 runtime = self._store.get(project_id)
                 if runtime is None:
                     raise KeyError(project_id)
+                self._ensure_state_defaults(runtime.state)
                 runtime.status = "failed"
                 runtime.awaiting_review = False
                 runtime.state["errors"].append({"node": node_name, "error": str(exc)})
+                self._bump_state_version(runtime, "advance_failed", {"node": node_name})
                 self._persist_store_locked()
                 return runtime
         with self._lock:
             runtime = self._store.get(project_id)
             if runtime is None:
                 raise KeyError(project_id)
+            self._ensure_state_defaults(runtime.state)
+            current_version = self._state_version(runtime)
+            if isinstance(execute_base_version, int) and current_version != execute_base_version:
+                conflict_payload = {
+                    "node": node_name,
+                    "expectedVersion": execute_base_version,
+                    "actualVersion": current_version,
+                }
+                runtime.state["errors"].append({"node": node_name, "error": "state_write_conflict"})
+                self._append_state_event(runtime, "write_conflict", conflict_payload)
+                self._append_activity(
+                    runtime,
+                    "state_conflict",
+                    {
+                        "actor": "状态存储",
+                        "reason": "version_mismatch",
+                        "expected": execute_base_version,
+                        "actual": current_version,
+                        "node": node_name,
+                    },
+                )
+                self._persist_store_locked()
+                return runtime
+            before_state = deepcopy(runtime.state)
             runtime.state = execution.state
+            self._ensure_state_defaults(runtime.state)
+            self._append_execution_state_events(runtime, node_name, before_state, runtime.state)
             timing_ms = runtime.state.setdefault("timing_ms", {})
             timing_ms[node_name] = int(timing_ms.get(node_name, 0)) + max(elapsed_ms, 0)
             timing_last_ms = runtime.state.setdefault("timing_last_ms", {})
@@ -1355,128 +1628,174 @@ class ProjectOrchestrator:
                 runtime.state["errors"].append(
                     {"node": "Director_Agent", "error": "max_iterations_exceeded"}
                 )
+            self._bump_state_version(
+                runtime,
+                "advance_commit",
+                {"node": node_name, "elapsedMs": elapsed_ms, "status": runtime.status},
+            )
             self._persist_store_locked()
             return runtime
 
-    def snapshot(self, project_id: str) -> Dict[str, object]:
-        with self._lock:
-            runtime = self._store.get(project_id)
-            if runtime is None:
-                raise KeyError(project_id)
-            state = runtime.state
-            current_node = state.get("current_node") or AGENT_SEQUENCE[0][0]
-            current_stage_name = "已完成" if runtime.status == "completed" else "Queued"
-            if runtime.status != "completed" and runtime.current_index < len(AGENT_SEQUENCE):
-                current_stage_name = AGENT_SEQUENCE[runtime.current_index][2]
-            if runtime.awaiting_review and state.get("approval_stage"):
-                current_stage_name = f"{state['approval_stage'].title()} Review"
-            quality_pass = 4 if runtime.status != "completed" else 5
-            quality_total = 5
-            render_cost = round(sum(state["cost_usage"].values()), 2)
-            eta = NODE_ETA.get(current_node, "00:00:20")
-            timing_ms = state.get("timing_ms") or {}
-            timing_last_ms = state.get("timing_last_ms") or {}
-            node_metrics = []
-            for idx, (node_name, _, display_name) in enumerate(AGENT_SEQUENCE):
-                run_count = runtime.history.count(node_name)
-                if runtime.status == "completed":
-                    node_status = "completed"
-                elif runtime.awaiting_review and idx == runtime.current_index:
-                    node_status = "review"
-                elif idx < runtime.current_index:
-                    node_status = "completed"
-                elif idx == runtime.current_index:
-                    node_status = "running"
-                else:
-                    node_status = "queued"
-                node_metrics.append(
-                    {
-                        "node": node_name,
-                        "label": display_name,
-                        "status": node_status,
-                        "runCount": run_count,
-                        "cost": round(state["cost_usage"].get(node_name, 0.0), 2),
-                        "durationMs": int(timing_ms.get(node_name, 0)),
-                        "lastDurationMs": int(timing_last_ms.get(node_name, 0)),
-                    }
-                )
-            assets = {
-                "scriptReady": bool(state.get("script_data")),
-                "styleReady": bool(state.get("global_style")),
-                "characterCount": len(state.get("character_assets", {})),
-                "storyboardCount": len(state.get("storyboard_frames", [])),
-                "videoCount": len(state.get("video_clips", [])),
-                "audioCount": len(state.get("audio_tracks", {})),
-                "finalVideoUri": (
-                    state["final_video"]["uri"] if state.get("final_video") else None
-                ),
-            }
-            character_gallery = [
-                _build_asset_preview(asset, "character")
-                for asset in state.get("character_assets", {}).values()
-            ]
-            storyboard_gallery = [
-                _build_asset_preview(asset, "storyboard")
-                for asset in state.get("storyboard_frames", [])
-            ]
-            video_gallery = [
-                _build_asset_preview(asset, "video")
-                for asset in state.get("video_clips", [])
-            ]
-            if state.get("final_video"):
-                video_gallery.append(_build_asset_preview(state["final_video"], "video"))
-            asset_gallery = {
-                "characters": character_gallery,
-                "storyboards": storyboard_gallery,
-                "videos": video_gallery,
-            }
-            execution_plan = self._execution_plan(runtime)
-            suggested_commands = self._suggested_commands(runtime)
-            intent_router_policy = self._runtime_intent_router_policy(runtime)
+    def _build_snapshot_payload(self, runtime: ProjectRuntime, compact: bool = False) -> Dict[str, object]:
+        state = runtime.state
+        current_node = state.get("current_node") or AGENT_SEQUENCE[0][0]
+        current_stage_name = "已完成" if runtime.status == "completed" else "Queued"
+        if runtime.status != "completed" and runtime.current_index < len(AGENT_SEQUENCE):
+            current_stage_name = AGENT_SEQUENCE[runtime.current_index][2]
+        if runtime.awaiting_review and state.get("approval_stage"):
+            current_stage_name = f"{state['approval_stage'].title()} Review"
+        quality_pass = 4 if runtime.status != "completed" else 5
+        quality_total = 5
+        render_cost = round(sum(state["cost_usage"].values()), 2)
+        eta = NODE_ETA.get(current_node, "00:00:20")
+        timing_ms = state.get("timing_ms") or {}
+        timing_last_ms = state.get("timing_last_ms") or {}
+        node_metrics = []
+        for idx, (node_name, _, display_name) in enumerate(AGENT_SEQUENCE):
+            run_count = runtime.history.count(node_name)
+            if runtime.status == "completed":
+                node_status = "completed"
+            elif runtime.awaiting_review and idx == runtime.current_index:
+                node_status = "review"
+            elif idx < runtime.current_index:
+                node_status = "completed"
+            elif idx == runtime.current_index:
+                node_status = "running"
+            else:
+                node_status = "queued"
+            node_metrics.append(
+                {
+                    "node": node_name,
+                    "label": display_name,
+                    "status": node_status,
+                    "runCount": run_count,
+                    "cost": round(state["cost_usage"].get(node_name, 0.0), 2),
+                    "durationMs": int(timing_ms.get(node_name, 0)),
+                    "lastDurationMs": int(timing_last_ms.get(node_name, 0)),
+                }
+            )
+        final_video_uri = state["final_video"]["uri"] if state.get("final_video") else None
+        if compact:
+            asset_gallery = {"characters": [], "storyboards": [], "videos": []}
+            storyboard_table = []
+            review_logs: List[Dict[str, object]] = []
+            chat_logs: List[Dict[str, object]] = []
+            activity_logs: List[Dict[str, object]] = []
+            intent_logs: List[Dict[str, object]] = []
+            history_logs: List[str] = []
+            round_history: List[Dict[str, object]] = []
+        else:
+            asset_gallery = self._asset_gallery_from_events(runtime, state)
+            videos = asset_gallery.get("videos", [])
+            if final_video_uri and not any(
+                isinstance(item, dict) and item.get("sourceUri") == final_video_uri for item in videos
+            ):
+                videos.append(_build_asset_preview(state["final_video"], "video"))
+                asset_gallery["videos"] = videos
+            storyboard_table = self._storyboard_table_from_events(runtime, state)
+            review_logs = list(runtime.review_logs[-MAX_REVIEW_LOGS:])
+            chat_logs = list(runtime.chat_logs[-MAX_CHAT_LOGS:])
+            activity_logs = list(runtime.activity_logs[-MAX_ACTIVITY_LOGS:])
             intent_logs = [
                 item["payload"]
                 for item in runtime.activity_logs
                 if item.get("kind") == "intent_router" and isinstance(item.get("payload"), dict)
-            ]
-            return {
-                "projectId": state["project_id"],
-                "prompt": state["user_prompt"],
-                "stage": current_stage_name,
-                "mode": "Human-in-the-loop",
-                "status": runtime.status,
-                "qualityPass": quality_pass,
-                "qualityTotal": quality_total,
-                "renderCost": render_cost,
-                "eta": eta,
-                "approvalRequired": runtime.awaiting_review,
-                "approvalStage": state.get("approval_stage"),
-                "currentNode": current_node,
-                "finalVideoUri": (
-                    state["final_video"]["uri"] if state.get("final_video") else None
-                ),
-                "assets": assets,
-                "assetGallery": asset_gallery,
-                "storyboardTable": self._storyboard_table(state),
-                "nodeMetrics": node_metrics,
-                "latestReview": runtime.review_logs[-1] if runtime.review_logs else None,
-                "reviewLogs": list(runtime.review_logs),
-                "chatLogs": list(runtime.chat_logs),
-                "activityLogs": list(runtime.activity_logs),
-                "executionPlan": execution_plan,
-                "executionPlanSummary": self._execution_plan_summary(runtime),
-                "suggestedCommands": suggested_commands,
-                "targetNodeOptions": self._target_node_options(),
-                "conversationRound": runtime.conversation_round,
-                "roundHistory": list(runtime.round_history),
-                "intentRouterPolicy": intent_router_policy,
-                "intentLogs": intent_logs[-20:],
-                "history": list(runtime.history),
-                "errors": list(state["errors"]),
-            }
+            ][-MAX_INTENT_LOGS:]
+            history_logs = list(runtime.history[-MAX_HISTORY_EVENTS:])
+            round_history = list(runtime.round_history[-MAX_ROUND_HISTORY:])
+        assets = {
+            "scriptReady": bool(state.get("script_data")),
+            "styleReady": bool(state.get("global_style")),
+            "characterCount": len(asset_gallery.get("characters", []))
+            if not compact
+            else len(state.get("character_assets", {})),
+            "storyboardCount": len(asset_gallery.get("storyboards", []))
+            if not compact
+            else len(state.get("storyboard_frames", [])),
+            "videoCount": len(asset_gallery.get("videos", []))
+            if not compact
+            else len(state.get("video_clips", [])),
+            "audioCount": len(state.get("audio_tracks", {})),
+            "finalVideoUri": final_video_uri,
+        }
+        return {
+            "projectId": state["project_id"],
+            "prompt": state["user_prompt"],
+            "stage": current_stage_name,
+            "mode": "Human-in-the-loop",
+            "status": runtime.status,
+            "qualityPass": quality_pass,
+            "qualityTotal": quality_total,
+            "renderCost": render_cost,
+            "eta": eta,
+            "approvalRequired": runtime.awaiting_review,
+            "approvalStage": state.get("approval_stage"),
+            "currentNode": current_node,
+            "finalVideoUri": final_video_uri,
+            "assets": assets,
+            "assetGallery": asset_gallery,
+            "storyboardTable": storyboard_table,
+            "nodeMetrics": node_metrics,
+            "latestReview": runtime.review_logs[-1] if runtime.review_logs else None,
+            "reviewLogs": review_logs,
+            "chatLogs": chat_logs,
+            "activityLogs": activity_logs,
+            "executionPlan": self._execution_plan(runtime),
+            "executionPlanSummary": self._execution_plan_summary(runtime),
+            "suggestedCommands": self._suggested_commands(runtime),
+            "targetNodeOptions": self._target_node_options(),
+            "conversationRound": runtime.conversation_round,
+            "roundHistory": round_history,
+            "intentRouterPolicy": self._runtime_intent_router_policy(runtime),
+            "intentLogs": intent_logs,
+            "history": history_logs,
+            "errors": list(state["errors"][-MAX_HISTORY_EVENTS:]),
+            "stateVersion": self._state_version(runtime),
+        }
+
+    def snapshot(self, project_id: str, compact: bool = False) -> Dict[str, object]:
+        with self._lock:
+            runtime = self._store.get(project_id)
+            if runtime is None:
+                raise KeyError(project_id)
+            self._ensure_state_defaults(runtime.state)
+            version = self._state_version(runtime)
+            if compact:
+                if (
+                    runtime.compact_snapshot_cache_payload is not None
+                    and runtime.compact_snapshot_cache_version == version
+                ):
+                    return runtime.compact_snapshot_cache_payload
+                payload = self._build_snapshot_payload(runtime, compact=True)
+                runtime.compact_snapshot_cache_version = version
+                runtime.compact_snapshot_cache_payload = payload
+                return payload
+            if runtime.snapshot_cache_payload is not None and runtime.snapshot_cache_version == version:
+                return runtime.snapshot_cache_payload
+            payload = self._build_snapshot_payload(runtime, compact=False)
+            runtime.snapshot_cache_version = version
+            runtime.snapshot_cache_payload = payload
+            return payload
 
     def sse_event(self, project_id: str) -> str:
-        payload = self.snapshot(project_id)
-        return f"event: snapshot\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        with self._lock:
+            runtime = self._store.get(project_id)
+            if runtime is None:
+                raise KeyError(project_id)
+            self._ensure_state_defaults(runtime.state)
+            version = self._state_version(runtime)
+            if runtime.sse_cache_payload and runtime.sse_cache_version == version:
+                return runtime.sse_cache_payload
+            if runtime.snapshot_cache_payload is not None and runtime.snapshot_cache_version == version:
+                payload = runtime.snapshot_cache_payload
+            else:
+                payload = self._build_snapshot_payload(runtime, compact=False)
+                runtime.snapshot_cache_version = version
+                runtime.snapshot_cache_payload = payload
+            result = f"event: snapshot\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            runtime.sse_cache_version = version
+            runtime.sse_cache_payload = result
+            return result
 
 
 orchestrator = ProjectOrchestrator()

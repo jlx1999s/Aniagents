@@ -58,6 +58,7 @@ class ManjuState(TypedDict):
     timing_ms: Dict[str, int]
     timing_last_ms: Dict[str, int]
     errors: List[Dict[str, Any]]
+    version: int
 
 
 def create_initial_state(user_prompt: str, project_id: Optional[str] = None) -> ManjuState:
@@ -89,4 +90,5 @@ def create_initial_state(user_prompt: str, project_id: Optional[str] = None) -> 
         timing_ms={},
         timing_last_ms={},
         errors=[],
+        version=1,
     )

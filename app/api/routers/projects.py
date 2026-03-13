@@ -81,9 +81,9 @@ def delete_projects(payload: BatchDeleteProjectsRequest) -> BatchDeleteProjectsR
 
 
 @router.get("/{project_id}", response_model=ProjectSnapshot)
-def get_project(project_id: str) -> ProjectSnapshot:
+def get_project(project_id: str, compact: bool = False) -> ProjectSnapshot:
     try:
-        return ProjectSnapshot(**orchestrator.snapshot(project_id))
+        return ProjectSnapshot(**orchestrator.snapshot(project_id, compact=compact))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project_not_found") from exc
 
