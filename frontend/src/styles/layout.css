@@ -32,6 +32,13 @@ body {
   pointer-events: none;
 }
 
+.background-canvas-static {
+  background:
+    radial-gradient(circle at 20% 25%, rgba(107, 181, 222, 0.18), transparent 38%),
+    radial-gradient(circle at 75% 70%, rgba(53, 130, 184, 0.2), transparent 42%),
+    linear-gradient(160deg, #071628 0%, #0a223d 45%, #0e2f4a 100%);
+}
+
 .ui-layer {
   position: absolute;
   inset: 0;

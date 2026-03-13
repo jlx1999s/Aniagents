@@ -1,0 +1,1083 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Agent 像素办公室 - 视觉优化版</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Noto+Sans+SC:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Noto Sans SC', sans-serif;
+            background-color: #0f111a;
+            color: #c0caf5;
+            margin: 0;
+            overflow: hidden;
+            display: flex;
+            height: 100vh;
+        }
+        .pixel-font {
+            font-family: 'Press Start 2P', 'Noto Sans SC', cursive;
+        }
+        canvas {
+            image-rendering: pixelated; /* 保持像素锐利 */
+            background-color: #2b2b36;
+        }
+        .log-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        .log-container::-webkit-scrollbar-track {
+            background: #1a1b26; 
+        }
+        .log-container::-webkit-scrollbar-thumb {
+            background: #414868; 
+            border-radius: 4px;
+        }
+        .glass-panel {
+            background: rgba(22, 22, 30, 0.9);
+            backdrop-filter: blur(10px);
+            border-left: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        
+        /* 扫描线与暗角效果 */
+        .crt-overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+            background-size: 100% 4px, 3px 100%;
+            box-shadow: inset 0 0 100px rgba(0,0,0,0.8);
+            pointer-events: none;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body class="flex flex-row w-full h-full">
+
+    <!-- 左侧：游戏画布区 -->
+    <div class="relative flex-1 flex items-center justify-center bg-black overflow-hidden" id="canvas-container">
+        <!-- 为了清晰，内部画布分辨率设为 800x600，css放大显示 -->
+        <canvas id="gameCanvas" width="800" height="600" class="rounded-lg shadow-[0_0_50px_rgba(0,0,0,1)]"></canvas>
+        <div class="crt-overlay rounded-lg"></div>
+    </div>
+
+    <!-- 右侧：控制面板与日志 -->
+    <div class="w-80 glass-panel flex flex-col h-full shadow-2xl z-20">
+        <div class="p-6 border-b border-gray-800">
+            <h1 class="text-xl font-bold text-white pixel-font mb-2 leading-tight tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-purple-400 to-pink-600">PIXEL<br>STUDIO</h1>
+            <p class="text-xs text-gray-400">AI Agent 协同工作站 v2.0</p>
+        </div>
+
+        <div class="p-6 flex flex-col gap-4 border-b border-gray-800">
+            <button id="btn-action" class="w-full py-3 px-4 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded shadow-[0_4px_0_#9f1239] active:shadow-[0_0px_0_#9f1239] active:translate-y-1 transition-all pixel-font text-xs flex justify-center items-center gap-2">
+                <span>▶</span> 导演喊Action!
+            </button>
+            <button id="btn-rest" class="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded shadow-[0_4px_0_#3730a3] active:shadow-[0_0px_0_#3730a3] active:translate-y-1 transition-all pixel-font text-xs flex justify-center items-center gap-2">
+                <span>☕</span> 宣布休息
+            </button>
+        </div>
+
+        <!-- 新增：环境控制面板 -->
+        <div class="p-6 border-b border-gray-800 bg-gray-900/50">
+            <h3 class="text-xs font-bold text-gray-400 pixel-font mb-3">环境控制 / ENV</h3>
+            <select id="env-selector" class="w-full bg-gray-800 text-gray-200 text-xs p-2 rounded pixel-font outline-none border border-gray-700 focus:border-indigo-500 transition-colors cursor-pointer appearance-none">
+                <option value="space">🌌 宇宙星空 (Space)</option>
+                <option value="day_clear">☀️ 晴朗白天 (Day Clear)</option>
+                <option value="day_rain">🌧️ 阴雨绵绵 (Rainy)</option>
+                <option value="night_clear">🌙 繁星都市 (Night)</option>
+                <option value="windy">🍃 疾风掠过 (Windy)</option>
+            </select>
+        </div>
+
+        <div class="flex-1 p-6 flex flex-col overflow-hidden">
+            <h2 class="text-sm font-bold text-gray-300 mb-4 pixel-font">活动日志 / LOG</h2>
+            <div id="log-output" class="log-container flex-1 overflow-y-auto space-y-3 text-xs text-gray-400 pr-2 font-mono">
+                <!-- 日志内容将在这里动态生成 -->
+            </div>
+        </div>
+    </div>
+
+<script>
+/**
+ * 核心引擎与逻辑 - 视觉重构版
+ */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+// 禁用图像平滑，保持像素锐利
+ctx.imageSmoothingEnabled = false;
+
+const logOutput = document.getElementById('log-output');
+
+// 角色配置数据 (颜色经过调优，加入发色设定)
+const ROLE_CONFIGS = {
+    director: { name: '导演', color: '#e06c75', hair: '#282c34', accessory: 'beret', deskX: 400, deskY: 150, action: '正在统筹全局...' },
+    sb_artist: { name: '分镜师', color: '#61afef', hair: '#d19a66', accessory: 'glasses', deskX: 200, deskY: 280, action: '正在绘制分镜草图...' },
+    char_designer: { name: '角色设计', color: '#c678dd', hair: '#98c379', accessory: 'hair', deskX: 600, deskY: 280, action: '正在设定角色造型...' },
+    sb_drawer: { name: '分镜画师', color: '#98c379', hair: '#e5c07b', accessory: 'pencil', deskX: 200, deskY: 420, action: '正在细化分镜线稿...' },
+    video_editor: { name: '视频师', color: '#e5c07b', hair: '#5c6370', accessory: 'headphones', deskX: 600, deskY: 420, action: '正在剪辑与合成...' }
+};
+
+// 全局状态
+let officeState = 'IDLE'; 
+let particles = [];
+let agents = [];
+let bgStars = []; // 用于存储星空顶的星星数据
+
+// === 新增：环境与天气系统状态 ===
+let currentEnv = 'space'; 
+let envClouds = [];
+let rainDrops = [];
+let windLines = [];
+
+// 工具函数
+const addLog = (msg, color = '#abb2bf') => {
+    const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    const logEl = document.createElement('div');
+    logEl.className = 'border-l-2 pl-2 transition-all duration-300';
+    logEl.style.borderColor = color;
+    logEl.innerHTML = `<span class="text-gray-600">[${time}]</span> <span style="color: ${color}">${msg}</span>`;
+    logOutput.appendChild(logEl);
+    logOutput.scrollTop = logOutput.scrollHeight;
+};
+
+const rand = (min, max) => Math.random() * (max - min) + min;
+
+// --- 类定义 ---
+
+class Particle {
+    constructor(x, y, type, color) {
+        this.x = x;
+        this.y = y;
+        this.type = type; 
+        this.color = color;
+        this.life = 1.0;
+        this.vx = rand(-1, 1);
+        this.vy = rand(-2, -0.5);
+        this.size = rand(2, 4);
+        
+        if (type === 'zzz') {
+            this.char = 'Z';
+            this.size = rand(6, 10);
+            this.vx = rand(0.2, 0.8);
+            this.vy = rand(-1, -0.2);
+        } else if (type === 'idea') {
+            this.char = '!';
+            this.size = 12;
+            this.vx = 0;
+            this.vy = -1;
+        }
+    }
+    update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        this.life -= 0.02;
+    }
+    draw(ctx) {
+        ctx.globalAlpha = Math.max(0, this.life);
+        if (this.type === 'work') {
+            ctx.fillStyle = this.color;
+            ctx.fillRect(this.x, this.y, this.size, this.size);
+        } else {
+            ctx.fillStyle = this.color;
+            ctx.font = `bold ${this.size}px "Press Start 2P"`;
+            ctx.fillText(this.char, this.x, this.y);
+        }
+        ctx.globalAlpha = 1.0;
+    }
+}
+
+class Agent {
+    constructor(id, config) {
+        this.id = id;
+        this.config = config;
+        // 休息区范围
+        this.loungeArea = { minX: 300, maxX: 500, minY: 480, maxY: 560 };
+        this.x = rand(this.loungeArea.minX, this.loungeArea.maxX); 
+        this.y = rand(this.loungeArea.minY, this.loungeArea.maxY);
+        this.targetX = this.x;
+        this.targetY = this.y;
+        this.speed = 1.5;
+        this.state = 'wander'; 
+        this.facing = 'front';
+        this.walkCycle = 0;
+        this.isWalking = false;
+        this.speechBubble = null;
+        this.speechTimer = 0;
+        // 新增：动作子状态与计时器
+        this.subState = 'wander_idle'; 
+        this.actionTimer = 0;
+    }
+
+    say(text, duration = 3000) {
+        this.speechBubble = text;
+        this.speechTimer = duration;
+    }
+
+    update(dt) {
+        if (this.speechTimer > 0) {
+            this.speechTimer -= dt;
+            if (this.speechTimer <= 0) this.speechBubble = null;
+        }
+
+        const dx = this.targetX - this.x;
+        const dy = this.targetY - this.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist > 2) {
+            this.isWalking = true;
+            this.x += (dx / dist) * this.speed;
+            this.y += (dy / dist) * this.speed;
+            this.walkCycle += 0.3; // 控制腿部动画速度
+            
+            if (Math.abs(dx) > Math.abs(dy)) {
+                this.facing = dx > 0 ? 'right' : 'left';
+            } else {
+                this.facing = dy > 0 ? 'front' : 'back';
+            }
+        } else {
+            this.x = this.targetX;
+            this.y = this.targetY;
+            this.isWalking = false;
+            this.walkCycle = 0;
+
+            if (this.state === 'going_to_desk') {
+                this.state = 'working';
+                this.subState = 'work_type';
+                this.actionTimer = rand(2000, 5000);
+                this.facing = 'back'; // 工作时面朝桌子
+                addLog(`${this.config.name} 就位，${this.config.action}`, this.config.color);
+            } else if (this.state === 'wander') {
+                if (this.actionTimer > 0) {
+                    this.actionTimer -= dt;
+                } else {
+                    const r = Math.random();
+                    if (r < 0.4) {
+                        this.targetX = this.x + rand(-40, 40);
+                        this.targetY = this.y + rand(-40, 40);
+                        this.targetX = Math.max(this.loungeArea.minX, Math.min(this.loungeArea.maxX, this.targetX));
+                        this.targetY = Math.max(this.loungeArea.minY, Math.min(this.loungeArea.maxY, this.targetY));
+                        this.subState = 'wander_walk';
+                    } else if (r < 0.7) {
+                        this.actionTimer = rand(2000, 4000);
+                        this.subState = 'wander_idle';
+                    } else {
+                        this.actionTimer = rand(3000, 5000);
+                        this.subState = 'wander_drink';
+                        this.facing = 'front';
+                    }
+                }
+            } else if (this.state === 'working') {
+                this.actionTimer -= dt;
+                if (this.actionTimer <= 0) {
+                    if (this.subState === 'work_type') {
+                        this.subState = 'work_think';
+                        this.actionTimer = rand(2000, 4000);
+                    } else {
+                        this.subState = 'work_type';
+                        this.actionTimer = rand(3000, 6000);
+                    }
+                }
+            }
+        }
+
+        // 特效
+        if (this.state === 'working') {
+            if (this.subState === 'work_type' && Math.random() < 0.1) {
+                particles.push(new Particle(this.x + rand(-10, 10), this.y - 30, 'work', this.config.color));
+            }
+            if (this.subState === 'work_think' && Math.random() < 0.01) {
+                particles.push(new Particle(this.x, this.y - 40, 'idea', '#e5c07b'));
+            }
+        }
+        if (this.state === 'wander' && !this.isWalking && this.subState === 'wander_idle' && Math.random() < 0.01) {
+            particles.push(new Particle(this.x + 10, this.y - 30, 'zzz', '#565f89'));
+        }
+    }
+
+    draw(ctx) {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+
+        // 身体基础尺寸
+        const headW = 16, headH = 14;
+        const bodyW = 14, bodyH = 12;
+        const legW = 4, legH = 8;
+        
+        // 核心：判断是否坐下
+        let isSitting = (this.state === 'working');
+        let sitOffset = isSitting ? 5 : 0; // 坐下时身体整体下沉隐藏腿部
+        
+        // 阴影
+        if (!isSitting) {
+            ctx.fillStyle = 'rgba(0,0,0,0.3)';
+            ctx.beginPath();
+            ctx.ellipse(0, 5, 12, 4, 0, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        // 动画偏移
+        let bobY = this.isWalking ? Math.abs(Math.sin(this.walkCycle)) * 2 : 0;
+        let leftLegY = 0, rightLegY = 0;
+        
+        if (this.isWalking) {
+            leftLegY = -Math.sin(this.walkCycle) * 3;
+            rightLegY = Math.sin(this.walkCycle) * 3;
+        }
+
+        // 疯狂打字时的身体震动
+        let shakeX = (isSitting && this.subState === 'work_type') ? rand(-0.5, 0.5) : 0;
+        ctx.translate(shakeX, -bobY + sitOffset);
+
+        // --- 绘制腿部 (坐下时不画腿) ---
+        if (!isSitting) {
+            ctx.fillStyle = '#282c34';
+            if (this.facing === 'left' || this.facing === 'right') {
+                // 侧面只画一条粗一点的腿或两条重叠
+                ctx.fillRect(-2, -legH + leftLegY, legW+2, legH);
+            } else {
+                ctx.fillRect(-6, -legH + leftLegY, legW, legH); // 左腿
+                ctx.fillRect(2, -legH + rightLegY, legW, legH);  // 右腿
+            }
+        }
+
+        // --- 绘制身体 ---
+        ctx.fillStyle = this.config.color;
+        // 身体阴影(下半部分暗)
+        ctx.fillRect(-bodyW/2, -legH - bodyH, bodyW, bodyH);
+        ctx.fillStyle = 'rgba(0,0,0,0.15)';
+        ctx.fillRect(-bodyW/2, -legH - bodyH/2, bodyW, bodyH/2);
+        
+        // 手臂动作
+        let lArmY = this.isWalking ? Math.sin(this.walkCycle)*3 : 0;
+        let rArmY = this.isWalking ? -Math.sin(this.walkCycle)*3 : 0;
+        
+        // 坐下打字时手臂疯狂运动
+        if (isSitting && this.subState === 'work_type') {
+            lArmY = rand(-2, 2);
+            rArmY = rand(-2, 2);
+        }
+
+        ctx.fillStyle = this.config.color;
+        if (this.facing === 'front' || this.facing === 'back') {
+            // 左臂
+            ctx.fillRect(-bodyW/2 - 3, -legH - bodyH + 1 + lArmY, 3, bodyH - 2);
+            // 右臂与喝咖啡动作
+            if (this.subState === 'wander_drink' && this.facing === 'front') {
+                ctx.fillRect(bodyW/2, -legH - bodyH + 1, 3, bodyH/2); 
+                // 咖啡杯
+                ctx.fillStyle = '#eceff4';
+                ctx.fillRect(2, -legH - bodyH - 3, 5, 6);
+                ctx.fillStyle = '#5e81ac';
+                ctx.fillRect(2, -legH - bodyH - 1, 5, 2);
+                ctx.fillStyle = this.config.color; // 恢复画笔颜色
+            } else {
+                ctx.fillRect(bodyW/2, -legH - bodyH + 1 + rArmY, 3, bodyH - 2);
+            }
+        } else if (this.facing === 'left') {
+            ctx.fillRect(-2, -legH - bodyH + 1 + lArmY, 4, bodyH - 2);
+        } else if (this.facing === 'right') {
+            ctx.fillRect(-2, -legH - bodyH + 1 + rArmY, 4, bodyH - 2);
+        }
+
+        // --- 绘制头部 ---
+        ctx.translate(0, -legH - bodyH); // 移动到脖子位置
+        
+        // 肤色
+        ctx.fillStyle = '#ffceb4';
+        ctx.fillRect(-headW/2, -headH, headW, headH);
+        
+        // 头发 (底层)
+        ctx.fillStyle = this.config.hair;
+        ctx.fillRect(-headW/2 - 1, -headH - 2, headW + 2, 6); // 顶发
+        
+        // 五官与发型细节 根据朝向
+        if (this.facing === 'front') {
+            ctx.fillRect(-headW/2, -headH, 4, headH-2); // 左鬓角
+            ctx.fillRect(headW/2 - 4, -headH, 4, headH-2); // 右鬓角
+            
+            ctx.fillStyle = '#111'; // 眼睛
+            ctx.fillRect(-4, -8, 2, 3);
+            ctx.fillRect(2, -8, 2, 3);
+            
+            // 腮红
+            ctx.fillStyle = 'rgba(255,100,100,0.3)';
+            ctx.fillRect(-6, -4, 3, 2);
+            ctx.fillRect(3, -4, 3, 2);
+            
+        } else if (this.facing === 'back') {
+            // 背面全是头发
+            ctx.fillStyle = this.config.hair;
+            ctx.fillRect(-headW/2, -headH, headW, headH);
+            
+        } else if (this.facing === 'left') {
+            ctx.fillRect(-headW/2, -headH, headW-4, headH); // 头发盖住后脑勺
+            ctx.fillStyle = '#111'; // 眼睛
+            ctx.fillRect(-5, -8, 2, 3);
+            ctx.fillStyle = '#ffceb4'; // 鼻子
+            ctx.fillRect(-9, -6, 2, 2);
+            
+        } else if (this.facing === 'right') {
+            ctx.fillRect(-headW/2 + 4, -headH, headW-4, headH); // 头发盖住后脑勺
+            ctx.fillStyle = '#111'; // 眼睛
+            ctx.fillRect(3, -8, 2, 3);
+            ctx.fillStyle = '#ffceb4'; // 鼻子
+            ctx.fillRect(7, -6, 2, 2);
+        }
+
+        // --- 专属配饰 ---
+        if (this.config.accessory === 'beret') { // 贝雷帽
+            ctx.fillStyle = '#cf2a27';
+            ctx.fillRect(-10, -headH - 4, 18, 5);
+            ctx.fillStyle = '#111';
+            ctx.fillRect(6, -headH - 6, 3, 3);
+        } else if (this.config.accessory === 'glasses') { // 眼镜
+            if (this.facing === 'front') {
+                ctx.fillStyle = 'rgba(255,255,255,0.6)';
+                ctx.fillRect(-6, -9, 5, 4);
+                ctx.fillRect(1, -9, 5, 4);
+                ctx.fillStyle = '#111'; // 框
+                ctx.fillRect(-7, -10, 7, 1);
+                ctx.fillRect(0, -10, 7, 1);
+            }
+        } else if (this.config.accessory === 'hair') { // 长发
+            ctx.fillStyle = this.config.hair;
+            if (this.facing === 'front' || this.facing === 'back') {
+                ctx.fillRect(-headW/2 - 2, -headH, 4, headH + 8);
+                ctx.fillRect(headW/2 - 2, -headH, 4, headH + 8);
+            }
+        } else if (this.config.accessory === 'pencil') { // 笔
+            if (this.facing === 'front' || this.facing === 'right') {
+                ctx.fillStyle = '#e5c07b';
+                ctx.fillRect(6, 4, 10, 2);
+                ctx.fillStyle = '#e06c75'; // 橡皮头
+                ctx.fillRect(16, 4, 3, 2);
+            }
+        } else if (this.config.accessory === 'headphones') { // 耳机
+            ctx.fillStyle = '#1e1e24';
+            ctx.fillRect(-headW/2 - 2, -headH - 3, headW + 4, 3); // 头带
+            if (this.facing !== 'back') {
+                ctx.fillRect(-headW/2 - 3, -8, 4, 8); // 左耳罩
+                ctx.fillRect(headW/2 - 1, -8, 4, 8); // 右耳罩
+            }
+        }
+
+        // --- 绘制语音气泡 ---
+        if (this.speechBubble) {
+            ctx.translate(0, -headH - 10); // 移到头顶上方
+            
+            ctx.font = 'bold 12px "Noto Sans SC"';
+            const padding = 8;
+            const metrics = ctx.measureText(this.speechBubble);
+            const w = metrics.width + padding * 2;
+            const h = 24;
+            
+            // 气泡阴影
+            ctx.fillStyle = 'rgba(0,0,0,0.2)';
+            ctx.beginPath(); ctx.roundRect(-w/2 + 2, -h + 2, w, h, 6); ctx.fill();
+            
+            // 气泡本体
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath(); ctx.roundRect(-w/2, -h, w, h, 6); ctx.fill();
+            
+            // 气泡尾巴
+            ctx.beginPath();
+            ctx.moveTo(-4, 0); ctx.lineTo(4, 0); ctx.lineTo(0, 5); ctx.fill();
+
+            // 文字
+            ctx.fillStyle = '#1e1e24';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(this.speechBubble, 0, -h/2);
+        }
+
+        ctx.restore();
+    }
+}
+
+// --- 环境渲染辅助函数 ---
+
+function drawFloor() {
+    const horizonY = 140; // 地板与全景窗的交界线
+
+    // === 动态室内光照颜色配置 ===
+    let isDay = currentEnv === 'day_clear' || currentEnv === 'windy';
+    let isRain = currentEnv === 'day_rain';
+    
+    // 室内环境光色调
+    const floorColor = isDay ? '#2b2c3d' : (isRain ? '#1f202e' : '#181825');
+    const gridColor  = isDay ? '#3b3c4d' : (isRain ? '#292a3b' : '#1e1e2e');
+    const pillarColor= isDay ? '#313244' : (isRain ? '#252636' : '#1e1e2e');
+    const pillarDark = isDay ? '#1e1e2e' : (isRain ? '#181825' : '#11111b');
+
+    // === 1. 动态窗外全景背景 (上半部分) ===
+    
+    if (currentEnv === 'space') {
+        // 深空色
+        ctx.fillStyle = '#050508'; 
+        ctx.fillRect(0, 0, canvas.width, horizonY);
+        // 星云特效
+        const gradient = ctx.createRadialGradient(canvas.width/2, horizonY, 10, canvas.width/2, horizonY, 400);
+        gradient.addColorStop(0, 'rgba(203, 166, 247, 0.15)');
+        gradient.addColorStop(1, 'rgba(5, 5, 8, 0)');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, canvas.width, horizonY);
+        
+        // 星星
+        bgStars.forEach(star => {
+            if (star.y > horizonY) return;
+            star.alpha += star.speed;
+            if (star.alpha > star.maxAlpha || star.alpha < 0.1) star.speed *= -1;
+            ctx.fillStyle = star.color;
+            ctx.globalAlpha = Math.max(0, Math.min(1, star.alpha));
+            ctx.fillRect(star.x, star.y, star.size, star.size);
+        });
+        ctx.globalAlpha = 1.0;
+
+        // 紫色星球
+        ctx.fillStyle = '#cba6f7';
+        ctx.beginPath(); ctx.arc(600, 60, 40, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.beginPath(); ctx.arc(590, 65, 40, 0, Math.PI*2); ctx.fill();
+        
+    } else if (currentEnv === 'day_clear' || currentEnv === 'windy') {
+        // 蓝天
+        const skyGrad = ctx.createLinearGradient(0, 0, 0, horizonY);
+        skyGrad.addColorStop(0, currentEnv === 'windy' ? '#74b9ff' : '#0984e3');
+        skyGrad.addColorStop(1, currentEnv === 'windy' ? '#dfe6e9' : '#74b9ff');
+        ctx.fillStyle = skyGrad;
+        ctx.fillRect(0, 0, canvas.width, horizonY);
+        
+        // 太阳
+        ctx.fillStyle = '#ffeaa7';
+        ctx.beginPath(); ctx.arc(150, 50, 25, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = 'rgba(255, 234, 167, 0.3)';
+        ctx.beginPath(); ctx.arc(150, 50, 40, 0, Math.PI*2); ctx.fill();
+
+    } else if (currentEnv === 'day_rain') {
+        // 阴天
+        const skyGrad = ctx.createLinearGradient(0, 0, 0, horizonY);
+        skyGrad.addColorStop(0, '#2d3436');
+        skyGrad.addColorStop(1, '#636e72');
+        ctx.fillStyle = skyGrad;
+        ctx.fillRect(0, 0, canvas.width, horizonY);
+
+    } else if (currentEnv === 'night_clear') {
+        // 繁星夜空
+        const skyGrad = ctx.createLinearGradient(0, 0, 0, horizonY);
+        skyGrad.addColorStop(0, '#0a0a1a');
+        skyGrad.addColorStop(1, '#1a1b36');
+        ctx.fillStyle = skyGrad;
+        ctx.fillRect(0, 0, canvas.width, horizonY);
+        
+        // 月亮
+        ctx.fillStyle = '#f5f6fa';
+        ctx.beginPath(); ctx.arc(650, 60, 20, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#0a0a1a'; // 月牙切除
+        ctx.beginPath(); ctx.arc(643, 55, 20, 0, Math.PI*2); ctx.fill();
+
+        // 夜空星星
+        bgStars.forEach(star => {
+            if (star.y > horizonY) return;
+            star.alpha += star.speed;
+            if (star.alpha > star.maxAlpha || star.alpha < 0.1) star.speed *= -1;
+            ctx.fillStyle = '#ffffff';
+            ctx.globalAlpha = Math.max(0, Math.min(1, star.alpha));
+            ctx.fillRect(star.x, star.y, star.size, star.size);
+        });
+        ctx.globalAlpha = 1.0;
+    }
+
+    // === 天气元素：云朵 (适用于白天/风天/阴天) ===
+    if (currentEnv !== 'space' && currentEnv !== 'night_clear') {
+        ctx.fillStyle = currentEnv === 'day_rain' ? '#b2bec3' : '#ffffff';
+        envClouds.forEach(c => {
+            // 云朵移动逻辑
+            c.x += c.speed * (currentEnv === 'windy' ? 6 : 1);
+            if(c.x > canvas.width + 100) c.x = -100;
+            
+            // 绘制像素感云朵
+            ctx.globalAlpha = 0.8;
+            ctx.beginPath(); 
+            ctx.arc(c.x, c.y, c.size, 0, Math.PI*2);
+            ctx.arc(c.x + c.size*0.8, c.y - c.size*0.4, c.size*0.7, 0, Math.PI*2);
+            ctx.arc(c.x + c.size*1.5, c.y, c.size*0.8, 0, Math.PI*2);
+            ctx.fill();
+            ctx.globalAlpha = 1.0;
+        });
+    }
+
+    // === 天气元素：雨滴 ===
+    if (currentEnv === 'day_rain') {
+        ctx.fillStyle = 'rgba(116, 185, 255, 0.6)';
+        rainDrops.forEach(r => {
+            r.y += r.speedY;
+            r.x += r.speedX;
+            if(r.y > horizonY) {
+                r.y = rand(-50, 0);
+                r.x = rand(0, canvas.width);
+            }
+            // 绘制雨丝
+            ctx.beginPath();
+            ctx.moveTo(r.x, r.y);
+            ctx.lineTo(r.x - r.speedX, r.y - r.speedY);
+            ctx.strokeStyle = 'rgba(116, 185, 255, 0.5)';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        });
+    }
+
+    // === 天气元素：风效线条 ===
+    if (currentEnv === 'windy') {
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+        ctx.lineWidth = 2;
+        windLines.forEach(w => {
+            w.x += w.speed;
+            if (w.x > canvas.width + w.len) {
+                w.x = -w.len;
+                w.y = rand(20, horizonY - 20);
+            }
+            ctx.beginPath();
+            ctx.moveTo(w.x, w.y);
+            ctx.lineTo(w.x - w.len, w.y);
+            ctx.stroke();
+        });
+    }
+
+    // === 城市远景天际线 (除了星空都显示) ===
+    if (currentEnv !== 'space') {
+        ctx.fillStyle = (currentEnv === 'day_clear' || currentEnv === 'windy') ? '#718093' : '#2f3640';
+        ctx.fillRect(50, horizonY - 30, 40, 30);
+        ctx.fillRect(90, horizonY - 45, 30, 45);
+        ctx.fillRect(200, horizonY - 25, 50, 25);
+        ctx.fillRect(450, horizonY - 50, 35, 50);
+        ctx.fillRect(500, horizonY - 35, 60, 35);
+        
+        // 夜景城市窗户亮灯
+        if (currentEnv === 'night_clear') {
+            ctx.fillStyle = '#fbc531';
+            for(let i=0; i<3; i++) {
+                ctx.fillRect(100, horizonY - 40 + i*10, 4, 4);
+                ctx.fillRect(110, horizonY - 40 + i*10, 4, 4);
+                ctx.fillRect(460, horizonY - 40 + i*10, 4, 4);
+                ctx.fillRect(520, horizonY - 20 + i*10, 4, 4);
+            }
+        }
+    }
+
+
+    // === 2. 全景落地窗边框 / 阳台金属栏杆 ===
+    // 玻璃反光
+    ctx.fillStyle = 'rgba(255,255,255,0.02)';
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(200, horizonY); ctx.lineTo(0, horizonY); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(canvas.width, 0); ctx.lineTo(canvas.width-300, horizonY); ctx.lineTo(canvas.width, horizonY); ctx.fill();
+
+    // 金属窗框 (承重柱) - 颜色随光照变化
+    ctx.fillStyle = pillarColor;
+    for(let i = 0; i <= canvas.width; i += 200) {
+        ctx.fillRect(i - 6, 0, 12, horizonY);
+        ctx.fillStyle = pillarDark; // 柱子暗面
+        ctx.fillRect(i, 0, 6, horizonY);
+        ctx.fillStyle = pillarColor; // 恢复
+    }
+
+    // 底部窗台/踢脚线
+    ctx.fillStyle = pillarDark;
+    ctx.fillRect(0, horizonY - 10, canvas.width, 10);
+    ctx.fillStyle = '#09090b'; // 缝隙
+    ctx.fillRect(0, horizonY, canvas.width, 4);
+
+    // === 3. 室内科技木地板 (颜色随光照变化) ===
+    ctx.fillStyle = floorColor; 
+    ctx.fillRect(0, horizonY + 4, canvas.width, canvas.height - horizonY);
+
+    // 地板网格/纹理
+    ctx.fillStyle = gridColor;
+    for (let i = horizonY + 4; i < canvas.height; i += 16) {
+        ctx.fillRect(0, i, canvas.width, 1);
+        for(let j = 0; j < canvas.width; j += 64) {
+            let offset = (i % 32 === 0) ? 0 : 32;
+            ctx.fillRect(j + offset, i, 1, 16);
+        }
+    }
+
+    // === 4. 墙角资料书架 (受光照影响的深灰) ===
+    ctx.fillStyle = isDay ? '#3f4052' : '#2b2c3d'; 
+    ctx.fillRect(20, horizonY - 80, 40, 80);
+    ctx.fillStyle = isDay ? '#2b2c3d' : '#181825'; 
+    ctx.fillRect(25, horizonY - 75, 30, 75);
+    const bookColors = ['#f38ba8', '#89b4fa', '#a6e3a1', '#f9e2af'];
+    for(let i=0; i<3; i++) {
+        ctx.fillStyle = isDay ? '#4f5066' : '#313244'; // 层板
+        ctx.fillRect(20, horizonY - 60 + i*20, 40, 4);
+        for(let j=0; j<4; j++) {
+            let pseudo = ((i + 1) * (j + 2) * 17) % 10;
+            if(pseudo > 2) {
+                ctx.fillStyle = bookColors[pseudo % bookColors.length];
+                let bh = 10 + (pseudo % 6);
+                ctx.fillRect(26 + j*7, horizonY - 60 + i*20 - bh, 5, bh);
+            }
+        }
+    }
+
+    // === 5. 悬浮全息投影板 ===
+    ctx.fillStyle = 'rgba(137, 180, 250, 0.1)'; 
+    ctx.fillRect(canvas.width/2 - 60, horizonY - 90, 120, 60);
+    ctx.strokeStyle = 'rgba(137, 180, 250, 0.4)'; 
+    ctx.lineWidth = 1;
+    ctx.strokeRect(canvas.width/2 - 60, horizonY - 90, 120, 60);
+    
+    ctx.fillStyle = 'rgba(243, 139, 168, 0.8)'; ctx.fillRect(canvas.width/2 - 50, horizonY - 75, 20, 2);
+    ctx.fillStyle = 'rgba(137, 180, 250, 0.8)'; ctx.fillRect(canvas.width/2 - 50, horizonY - 65, 40, 2);
+    ctx.fillStyle = 'rgba(166, 227, 161, 0.8)'; ctx.fillRect(canvas.width/2 - 50, horizonY - 55, 30, 2);
+
+    // === 6. 饮水机 ===
+    ctx.fillStyle = '#cdd6f4'; 
+    ctx.fillRect(720, horizonY - 45, 26, 45);
+    ctx.fillStyle = '#89b4fa'; 
+    ctx.beginPath(); ctx.arc(733, horizonY - 55, 10, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.3)'; 
+    ctx.beginPath(); ctx.arc(730, horizonY - 58, 4, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#1e1e2e'; 
+    ctx.fillRect(723, horizonY - 30, 20, 12);
+    ctx.fillStyle = '#f38ba8'; ctx.fillRect(726, horizonY - 33, 4, 4);
+    ctx.fillStyle = '#89dceb'; ctx.fillRect(736, horizonY - 33, 4, 4);
+
+    // === 7. 休息区地毯 ===
+    const rx = 280, ry = 480, rw = 240, rh = 100;
+    ctx.fillStyle = isDay ? 'rgba(50, 50, 66, 0.8)' : 'rgba(30, 30, 46, 0.8)';
+    ctx.beginPath(); ctx.roundRect(rx, ry, rw, rh, 12); ctx.fill();
+    ctx.strokeStyle = '#89b4fa'; 
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.roundRect(rx+2, ry+2, rw-4, rh-4, 10); ctx.stroke();
+    
+    ctx.fillStyle = isDay ? '#414254' : '#313244';
+    ctx.beginPath(); ctx.arc(rx + rw/2, ry + rh/2, 35, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#cba6f7';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(rx + rw/2, ry + rh/2, 25, 0, Math.PI*2); ctx.stroke();
+
+    ctx.fillStyle = 'rgba(203, 166, 247, 0.7)';
+    ctx.font = '10px "Press Start 2P"';
+    ctx.fillText('STAR LOUNGE', rx + rw/2 - 50, ry + rh/2 + 4);
+}
+
+function drawPlant(x, y) {
+    ctx.fillStyle = '#8fbcbb'; // 花盆
+    ctx.fillRect(x, y, 16, 12);
+    ctx.fillStyle = '#4c566a'; // 花盆阴影
+    ctx.fillRect(x, y+8, 16, 4);
+    
+    ctx.fillStyle = '#a3be8c'; // 叶子
+    ctx.beginPath(); ctx.arc(x + 8, y - 6, 10, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 2, y - 2, 8, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 14, y - 2, 8, 0, Math.PI*2); ctx.fill();
+}
+
+// 分离：绘制桌子主体
+function drawDeskBase(config, agent) {
+    const dx = config.deskX;
+    const dy = config.deskY;
+    
+    // 办公桌
+    const deskW = 70, deskH = 30;
+    ctx.fillStyle = '#d08770'; // 桌面高光
+    ctx.fillRect(dx - deskW/2, dy - 15, deskW, deskH);
+    ctx.fillStyle = '#bf616a'; // 桌侧面(阴影)
+    ctx.fillRect(dx - deskW/2, dy + 15, deskW, 6);
+    
+    // 桌腿
+    ctx.fillStyle = '#3b4252';
+    ctx.fillRect(dx - deskW/2 + 4, dy + 15, 4, 14);
+    ctx.fillRect(dx + deskW/2 - 8, dy + 15, 4, 14);
+
+    // 桌面装饰
+    ctx.fillStyle = '#eceff4';
+    ctx.fillRect(dx + 20, dy - 5, 6, 8);
+    ctx.fillStyle = '#5e81ac'; // 杯身条纹
+    ctx.fillRect(dx + 20, dy, 6, 2);
+
+    if (config.name === '分镜师' || config.name === '分镜画师') {
+        ctx.fillStyle = '#ebcb8b'; // 黄色文件夹
+        ctx.fillRect(dx - 28, dy - 8, 14, 18);
+        ctx.fillStyle = '#fff'; ctx.fillRect(dx - 26, dy - 6, 10, 14);
+    } else {
+        drawPlant(dx - 32, dy - 18); // 绿植
+    }
+
+    // 电脑显示器
+    ctx.fillStyle = '#e5e9f0'; 
+    ctx.fillRect(dx - 5, dy - 8, 10, 8); 
+    ctx.fillRect(dx - 15, dy - 10, 30, 4); 
+    
+    ctx.fillStyle = '#2e3440'; 
+    ctx.fillRect(dx - 18, dy - 30, 36, 24);
+    
+    // 屏幕光影逻辑
+    if (agent && agent.state === 'working') {
+        ctx.fillStyle = '#88c0d0'; // 亮屏
+        ctx.fillRect(dx - 16, dy - 28, 32, 20);
+        
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        ctx.fillRect(dx - 14, dy - 26, 20, 2);
+        ctx.fillRect(dx - 14, dy - 22, 28, 2);
+        ctx.fillRect(dx - 14, dy - 18, 15, 2);
+    } else {
+        ctx.fillStyle = '#111'; // 黑屏
+        ctx.fillRect(dx - 16, dy - 28, 32, 20);
+    }
+
+    // 名字标签
+    ctx.fillStyle = 'rgba(26, 27, 38, 0.8)';
+    ctx.beginPath(); ctx.roundRect(dx - 25, dy + 25, 50, 14, 4); ctx.fill();
+    ctx.fillStyle = config.color;
+    ctx.font = 'bold 9px "Noto Sans SC"';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(config.name, dx, dy + 32);
+}
+
+// 分离：绘制椅子 (重点！椅子靠背将画在角色的前面，完美呈现“被包裹”的坐姿)
+function drawChair(config, agent) {
+    const dx = config.deskX;
+    const dy = config.deskY;
+    const isOccupied = agent && agent.state === 'working';
+    
+    // 有人坐时椅子会往前推
+    const chairY = isOccupied ? dy + 8 : dy + 15;
+    
+    // 阴影
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.beginPath(); ctx.ellipse(dx, chairY + 8, 14, 5, 0, 0, Math.PI*2); ctx.fill();
+
+    // 没被占用时画坐垫（有人坐时被屁股挡住）
+    if (!isOccupied) {
+        ctx.fillStyle = '#4c566a';
+        ctx.fillRect(dx - 12, chairY, 24, 6); 
+    }
+
+    // 椅子腿
+    ctx.fillStyle = '#2e3440';
+    ctx.fillRect(dx - 8, chairY + (isOccupied?2:6), 4, 8); 
+    ctx.fillRect(dx + 4, chairY + (isOccupied?2:6), 4, 8); 
+
+    // 靠背 (最前面一层，遮挡角色背部下半部分)
+    ctx.fillStyle = '#434c5e';
+    ctx.fillRect(dx - 10, chairY - 16, 20, 18);
+    ctx.fillStyle = '#3b4252';
+    ctx.fillRect(dx - 8, chairY - 14, 16, 14);
+}
+
+// 分离：绘制桌面发光特效（光晕需要在角色上方叠加）
+function drawDeskGlow(config) {
+    const dx = config.deskX;
+    const dy = config.deskY;
+    ctx.save();
+    ctx.globalCompositeOperation = 'screen';
+    const gradient = ctx.createRadialGradient(dx, dy-10, 10, dx, dy-10, 40);
+    gradient.addColorStop(0, 'rgba(136, 192, 208, 0.4)');
+    gradient.addColorStop(1, 'rgba(136, 192, 208, 0)');
+    ctx.fillStyle = gradient;
+    ctx.beginPath(); ctx.arc(dx, dy-10, 40, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+}
+
+// 初始化
+function init() {
+    for (const [id, config] of Object.entries(ROLE_CONFIGS)) {
+        agents.push(new Agent(id, config));
+    }
+    
+    // 初始化星空数据
+    for (let i = 0; i < 200; i++) {
+        bgStars.push({
+            x: rand(0, canvas.width),
+            y: rand(0, canvas.height), // Y 坐标可以全屏，绘制时通过 horizonY 截断
+            size: Math.random() < 0.9 ? 1 : 2,
+            alpha: rand(0.1, 0.8),
+            maxAlpha: rand(0.5, 1.0),
+            speed: rand(0.005, 0.02) * (Math.random() < 0.5 ? 1 : -1),
+            color: Math.random() < 0.8 ? '#ffffff' : (Math.random() < 0.5 ? '#89b4fa' : '#f9e2af')
+        });
+    }
+
+    // 初始化云朵数据
+    for (let i = 0; i < 6; i++) {
+        envClouds.push({
+            x: rand(0, canvas.width),
+            y: rand(10, 80),
+            size: rand(15, 30),
+            speed: rand(0.1, 0.3)
+        });
+    }
+
+    // 初始化雨滴数据
+    for (let i = 0; i < 100; i++) {
+        rainDrops.push({
+            x: rand(0, canvas.width),
+            y: rand(0, 140),
+            speedY: rand(4, 8),
+            speedX: rand(1, 2)
+        });
+    }
+
+    // 初始化风效数据
+    for (let i = 0; i < 15; i++) {
+        windLines.push({
+            x: rand(0, canvas.width),
+            y: rand(20, 120),
+            len: rand(20, 80),
+            speed: rand(10, 20)
+        });
+    }
+
+    addLog('系统初始化完毕。星空主题已加载。', '#cba6f7');
+    addLog('团队当前处于 [休息/待机] 状态。', '#81a1c1');
+}
+
+// 主循环
+let lastTime = performance.now();
+function gameLoop(now) {
+    const dt = now - lastTime;
+    lastTime = now;
+
+    // 清除画布
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // 1. 绘制静态背景
+    drawFloor();
+    
+    // 2. 收集所有需要绘制的实体，通过拆分桌子、椅子、光晕层进行精确的Z轴排序
+    let renderables = [];
+    
+    Object.values(ROLE_CONFIGS).forEach(conf => {
+        renderables.push({ type: 'desk_base', y: conf.deskY, data: conf });
+        // 椅子的Y轴在桌子后，渲染时会排在桌子之后
+        renderables.push({ type: 'chair', y: conf.deskY + 14, data: conf });
+        // 光晕加在最上层
+        renderables.push({ type: 'desk_glow', y: conf.deskY + 100, data: conf });
+    });
+    
+    // 放入角色
+    agents.forEach(agent => {
+        renderables.push({ type: 'agent', y: agent.y, data: agent });
+    });
+
+    // 深度排序
+    renderables.sort((a, b) => a.y - b.y);
+
+    // 3. 按顺序渲染
+    renderables.forEach(item => {
+        if (item.type === 'desk_base') {
+            const owner = agents.find(a => a.config.name === item.data.name);
+            drawDeskBase(item.data, owner);
+        } else if (item.type === 'chair') {
+            const owner = agents.find(a => a.config.name === item.data.name);
+            drawChair(item.data, owner);
+        } else if (item.type === 'desk_glow') {
+            const owner = agents.find(a => a.config.name === item.data.name);
+            if (owner && owner.state === 'working') {
+                drawDeskGlow(item.data);
+            }
+        } else if (item.type === 'agent') {
+            item.data.update(dt);
+            item.data.draw(ctx);
+        }
+    });
+
+    // 4. 更新和绘制顶层粒子特效
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.update();
+        p.draw(ctx);
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    // 全局暗角效果 (Canvas 内实现，更自然)
+    const gradient = ctx.createRadialGradient(canvas.width/2, canvas.height/2, canvas.height/3, canvas.width/2, canvas.height/2, canvas.width);
+    gradient.addColorStop(0, 'rgba(0,0,0,0)');
+    gradient.addColorStop(1, 'rgba(0,0,0,0.6)');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // 根据天气附加的全局滤镜 (如下雨天偏冷灰)
+    if (currentEnv === 'day_rain') {
+        ctx.fillStyle = 'rgba(45, 52, 54, 0.15)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    requestAnimationFrame(gameLoop);
+}
+
+// --- 交互逻辑 ---
+
+// 新增：监听环境控制下拉菜单
+document.getElementById('env-selector').addEventListener('change', (e) => {
+    currentEnv = e.target.value;
+    const envNames = {
+        'space': '🌌 宇宙星空模式',
+        'day_clear': '☀️ 晴朗白天模式',
+        'day_rain': '🌧️ 阴雨绵绵模式',
+        'night_clear': '🌙 繁星都市模式',
+        'windy': '🍃 疾风掠过模式'
+    };
+    addLog(`【环境变更】已切换至 ${envNames[currentEnv]}`, '#a29bfe');
+});
+
+document.getElementById('btn-action').addEventListener('click', () => {
+    if (officeState === 'WORKING') return;
+    
+    officeState = 'MEETING';
+    addLog('【Action】指令下达，开始分配任务...', '#e06c75');
+    
+    const director = agents.find(a => a.id === 'director');
+    
+    director.state = 'going_to_desk';
+    director.targetX = director.config.deskX;
+    // 目标Y轴调整：走到座位上
+    director.targetY = director.config.deskY + 8; 
+    director.say("各就各位，新项目启动！", 3500);
+    
+    agents.forEach(a => {
+        if(a.id !== 'director') {
+            particles.push(new Particle(a.x, a.y - 40, 'idea', '#e5c07b'));
+            a.facing = director.x > a.x ? 'right' : 'left'; 
+        }
+    });
+
+    setTimeout(() => {
+        officeState = 'WORKING';
+        agents.forEach(a => {
+            if (a.id !== 'director') {
+                a.state = 'going_to_desk';
+                a.targetX = a.config.deskX;
+                // 目标Y轴调整：坐入椅子中
+                a.targetY = a.config.deskY + 8; 
+                a.say("收到！", 2000);
+            }
+        });
+        addLog('团队已进入 [工作/产出] 状态。', '#61afef');
+    }, 1500);
+});
+
+document.getElementById('btn-rest').addEventListener('click', () => {
+    if (officeState === 'IDLE') return;
+    
+    officeState = 'IDLE';
+    addLog('【Rest】进入休息时间，恢复体力。', '#c678dd');
+    
+    const director = agents.find(a => a.id === 'director');
+    director.say("进度不错，大家休息一下吧。", 3000);
+
+    agents.forEach(a => {
+        a.state = 'wander';
+        a.targetX = rand(a.loungeArea.minX, a.loungeArea.maxX);
+        a.targetY = rand(a.loungeArea.minY, a.loungeArea.maxY);
+    });
+});
+
+// 启动
+init();
+requestAnimationFrame(gameLoop);
+
+</script>
+</body>
+</html>

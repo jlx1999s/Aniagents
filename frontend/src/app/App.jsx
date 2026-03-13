@@ -8,6 +8,7 @@ export default function App() {
   const [coords, setCoords] = useState('坐标: 0.000, 0.000');
   const [activeLink, setActiveLink] = useState('总览');
   const [workspaceMode, setWorkspaceMode] = useState(false);
+  const isDynamicBackground = activeLink === '总览';
   const {
     snapshot,
     projectIds,
@@ -15,6 +16,7 @@ export default function App() {
     activeProjectId,
     draftPrompt,
     loadingProjects,
+    projectStats,
     connectionStatus,
     errorMessage,
     actions
@@ -35,7 +37,7 @@ export default function App() {
 
   return (
     <div className="app-root">
-      <BackgroundCanvas onCoordsChange={setCoords} />
+      <BackgroundCanvas onCoordsChange={setCoords} isAnimated={isDynamicBackground} />
       <AppShell
         navLinks={navLinks}
         activeLink={activeLink}
@@ -50,6 +52,7 @@ export default function App() {
         activeProjectId={activeProjectId}
         draftPrompt={draftPrompt}
         loadingProjects={loadingProjects}
+        projectStats={projectStats}
         connectionStatus={connectionStatus}
         errorMessage={errorMessage}
         actions={actions}

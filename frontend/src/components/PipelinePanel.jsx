@@ -142,7 +142,7 @@ export default function PipelinePanel({
             <button className="review-btn" type="button" onClick={() => actions.advanceNow()}>
               手动推进
             </button>
-            <button className="review-btn" type="button" onClick={() => actions.approveReview()}>
+            <button className="review-btn" type="button" disabled={!canReview} onClick={() => actions.approveReview()}>
               快速通过
             </button>
           </div>

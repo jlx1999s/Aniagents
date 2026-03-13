@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Agent 像素办公室 - 视觉优化版</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Noto+Sans+SC:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Noto Sans SC', sans-serif;
+            background-color: #0f111a;
+            color: #c0caf5;
+            margin: 0;
+            overflow: hidden;
+            display: flex;
+            height: 100vh;
+        }
+        .pixel-font {
+            font-family: 'Press Start 2P', 'Noto Sans SC', cursive;
+        }
+        canvas {
+            image-rendering: pixelated; /* 保持像素锐利 */
+            background-color: #2b2b36;
+        }
+        .log-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        .log-container::-webkit-scrollbar-track {
+            background: #1a1b26; 
+        }
+        .log-container::-webkit-scrollbar-thumb {
+            background: #414868; 
+            border-radius: 4px;
+        }
+        .glass-panel {
+            background: rgba(22, 22, 30, 0.9);
+            backdrop-filter: blur(10px);
+            border-left: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        
+        /* 扫描线与暗角效果 */
+        .crt-overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+            background-size: 100% 4px, 3px 100%;
+            box-shadow: inset 0 0 100px rgba(0,0,0,0.8);
+            pointer-events: none;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body class="flex flex-row w-full h-full">
+
+    <!-- 左侧：游戏画布区 -->
+    <div class="relative flex-1 flex items-center justify-center bg-black overflow-hidden" id="canvas-container">
+        <!-- 为了清晰，内部画布分辨率设为 800x600，css放大显示 -->
+        <canvas id="gameCanvas" width="800" height="600" class="rounded-lg shadow-[0_0_50px_rgba(0,0,0,1)]"></canvas>
+        <div class="crt-overlay rounded-lg"></div>
+    </div>
+
+    <!-- 右侧：控制面板与日志 -->
+    <div class="w-80 glass-panel flex flex-col h-full shadow-2xl z-20">
+        <div class="p-6 border-b border-gray-800">
+            <h1 class="text-xl font-bold text-white pixel-font mb-2 leading-tight tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-purple-400 to-pink-600">PIXEL<br>STUDIO</h1>
+            <p class="text-xs text-gray-400">AI Agent 协同工作站 v2.0</p>
+        </div>
+
+        <div class="p-6 flex flex-col gap-4 border-b border-gray-800">
+            <button id="btn-action" class="w-full py-3 px-4 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded shadow-[0_4px_0_#9f1239] active:shadow-[0_0px_0_#9f1239] active:translate-y-1 transition-all pixel-font text-xs flex justify-center items-center gap-2">
+                <span>▶</span> 导演喊Action!
+            </button>
+            <button id="btn-rest" class="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded shadow-[0_4px_0_#3730a3] active:shadow-[0_0px_0_#3730a3] active:translate-y-1 transition-all pixel-font text-xs flex justify-center items-center gap-2">
+                <span>☕</span> 宣布休息
+            </button>
+        </div>
+
+        <div class="flex-1 p-6 flex flex-col overflow-hidden">
+            <h2 class="text-sm font-bold text-gray-300 mb-4 pixel-font">活动日志 / LOG</h2>
+            <div id="log-output" class="log-container flex-1 overflow-y-auto space-y-3 text-xs text-gray-400 pr-2 font-mono">
+                <!-- 日志内容将在这里动态生成 -->
+            </div>
+        </div>
+    </div>
+
+<script>
+/**
+ * 核心引擎与逻辑 - 视觉重构版
+ */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+// 禁用图像平滑，保持像素锐利
+ctx.imageSmoothingEnabled = false;
+
+const logOutput = document.getElementById('log-output');
+
+// 角色配置数据 (颜色经过调优，加入发色设定)
+const ROLE_CONFIGS = {
+    director: { name: '导演', color: '#e06c75', hair: '#282c34', accessory: 'beret', deskX: 400, deskY: 150, action: '正在统筹全局...' },
+    sb_artist: { name: '分镜师', color: '#61afef', hair: '#d19a66', accessory: 'glasses', deskX: 200, deskY: 280, action: '正在绘制分镜草图...' },
+    char_designer: { name: '角色设计', color: '#c678dd', hair: '#98c379', accessory: 'hair', deskX: 600, deskY: 280, action: '正在设定角色造型...' },
+    sb_drawer: { name: '分镜画师', color: '#98c379', hair: '#e5c07b', accessory: 'pencil', deskX: 200, deskY: 420, action: '正在细化分镜线稿...' },
+    video_editor: { name: '视频师', color: '#e5c07b', hair: '#5c6370', accessory: 'headphones', deskX: 600, deskY: 420, action: '正在剪辑与合成...' }
+};
+
+// 全局状态
+let officeState = 'IDLE'; 
+let particles = [];
+let agents = [];
+
+// 工具函数
+const addLog = (msg, color = '#abb2bf') => {
+    const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    const logEl = document.createElement('div');
+    logEl.className = 'border-l-2 pl-2 transition-all duration-300';
+    logEl.style.borderColor = color;
+    logEl.innerHTML = `<span class="text-gray-600">[${time}]</span> <span style="color: ${color}">${msg}</span>`;
+    logOutput.appendChild(logEl);
+    logOutput.scrollTop = logOutput.scrollHeight;
+};
+
+const rand = (min, max) => Math.random() * (max - min) + min;
+
+// --- 类定义 ---
+
+class Particle {
+    constructor(x, y, type, color) {
+        this.x = x;
+        this.y = y;
+        this.type = type; 
+        this.color = color;
+        this.life = 1.0;
+        this.vx = rand(-1, 1);
+        this.vy = rand(-2, -0.5);
+        this.size = rand(2, 4);
+        
+        if (type === 'zzz') {
+            this.char = 'Z';
+            this.size = rand(6, 10);
+            this.vx = rand(0.2, 0.8);
+            this.vy = rand(-1, -0.2);
+        } else if (type === 'idea') {
+            this.char = '!';
+            this.size = 12;
+            this.vx = 0;
+            this.vy = -1;
+        }
+    }
+    update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        this.life -= 0.02;
+    }
+    draw(ctx) {
+        ctx.globalAlpha = Math.max(0, this.life);
+        if (this.type === 'work') {
+            ctx.fillStyle = this.color;
+            ctx.fillRect(this.x, this.y, this.size, this.size);
+        } else {
+            ctx.fillStyle = this.color;
+            ctx.font = `bold ${this.size}px "Press Start 2P"`;
+            ctx.fillText(this.char, this.x, this.y);
+        }
+        ctx.globalAlpha = 1.0;
+    }
+}
+
+class Agent {
+    constructor(id, config) {
+        this.id = id;
+        this.config = config;
+        // 休息区范围
+        this.loungeArea = { minX: 300, maxX: 500, minY: 480, maxY: 560 };
+        this.x = rand(this.loungeArea.minX, this.loungeArea.maxX); 
+        this.y = rand(this.loungeArea.minY, this.loungeArea.maxY);
+        this.targetX = this.x;
+        this.targetY = this.y;
+        this.speed = 1.5;
+        this.state = 'wander'; 
+        this.facing = 'front';
+        this.walkCycle = 0;
+        this.isWalking = false;
+        this.speechBubble = null;
+        this.speechTimer = 0;
+    }
+
+    say(text, duration = 3000) {
+        this.speechBubble = text;
+        this.speechTimer = duration;
+    }
+
+    update(dt) {
+        if (this.speechTimer > 0) {
+            this.speechTimer -= dt;
+            if (this.speechTimer <= 0) this.speechBubble = null;
+        }
+
+        const dx = this.targetX - this.x;
+        const dy = this.targetY - this.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist > 2) {
+            this.isWalking = true;
+            this.x += (dx / dist) * this.speed;
+            this.y += (dy / dist) * this.speed;
+            this.walkCycle += 0.3; // 控制腿部动画速度
+            
+            if (Math.abs(dx) > Math.abs(dy)) {
+                this.facing = dx > 0 ? 'right' : 'left';
+            } else {
+                this.facing = dy > 0 ? 'front' : 'back';
+            }
+        } else {
+            this.x = this.targetX;
+            this.y = this.targetY;
+            this.isWalking = false;
+            this.walkCycle = 0;
+
+            if (this.state === 'going_to_desk') {
+                this.state = 'working';
+                this.facing = 'back'; // 工作时面朝桌子
+                addLog(`${this.config.name} 就位，${this.config.action}`, this.config.color);
+            } else if (this.state === 'wander') {
+                if (Math.random() < 0.01) {
+                    this.targetX = this.x + rand(-40, 40);
+                    this.targetY = this.y + rand(-40, 40);
+                    // 保持在休息区内
+                    this.targetX = Math.max(this.loungeArea.minX, Math.min(this.loungeArea.maxX, this.targetX));
+                    this.targetY = Math.max(this.loungeArea.minY, Math.min(this.loungeArea.maxY, this.targetY));
+                }
+            }
+        }
+
+        // 特效
+        if (this.state === 'working' && Math.random() < 0.08) {
+            particles.push(new Particle(this.x + rand(-10, 10), this.y - 30, 'work', this.config.color));
+        }
+        if (this.state === 'wander' && !this.isWalking && Math.random() < 0.01) {
+            particles.push(new Particle(this.x + 10, this.y - 30, 'zzz', '#565f89'));
+        }
+    }
+
+    draw(ctx) {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+
+        // 身体基础尺寸
+        const headW = 16, headH = 14;
+        const bodyW = 14, bodyH = 12;
+        const legW = 4, legH = 8;
+        
+        // 阴影
+        ctx.fillStyle = 'rgba(0,0,0,0.3)';
+        ctx.beginPath();
+        ctx.ellipse(0, 5, 12, 4, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 动画偏移
+        let bobY = this.isWalking ? Math.abs(Math.sin(this.walkCycle)) * 2 : 0;
+        let leftLegY = 0, rightLegY = 0;
+        
+        if (this.isWalking) {
+            leftLegY = -Math.sin(this.walkCycle) * 3;
+            rightLegY = Math.sin(this.walkCycle) * 3;
+        }
+
+        ctx.translate(0, -bobY); // 整体上下浮动
+
+        // --- 绘制腿部 (深色裤子) ---
+        ctx.fillStyle = '#282c34';
+        if (this.facing === 'left' || this.facing === 'right') {
+            // 侧面只画一条粗一点的腿或两条重叠
+            ctx.fillRect(-2, -legH + leftLegY, legW+2, legH);
+        } else {
+            ctx.fillRect(-6, -legH + leftLegY, legW, legH); // 左腿
+            ctx.fillRect(2, -legH + rightLegY, legW, legH);  // 右腿
+        }
+
+        // --- 绘制身体 ---
+        ctx.fillStyle = this.config.color;
+        // 身体阴影(下半部分暗)
+        ctx.fillRect(-bodyW/2, -legH - bodyH, bodyW, bodyH);
+        ctx.fillStyle = 'rgba(0,0,0,0.15)';
+        ctx.fillRect(-bodyW/2, -legH - bodyH/2, bodyW, bodyH/2);
+        
+        // --- 绘制头部 ---
+        ctx.translate(0, -legH - bodyH); // 移动到脖子位置
+        
+        // 肤色
+        ctx.fillStyle = '#ffceb4';
+        ctx.fillRect(-headW/2, -headH, headW, headH);
+        
+        // 头发 (底层)
+        ctx.fillStyle = this.config.hair;
+        ctx.fillRect(-headW/2 - 1, -headH - 2, headW + 2, 6); // 顶发
+        
+        // 五官与发型细节 根据朝向
+        if (this.facing === 'front') {
+            ctx.fillRect(-headW/2, -headH, 4, headH-2); // 左鬓角
+            ctx.fillRect(headW/2 - 4, -headH, 4, headH-2); // 右鬓角
+            
+            ctx.fillStyle = '#111'; // 眼睛
+            ctx.fillRect(-4, -8, 2, 3);
+            ctx.fillRect(2, -8, 2, 3);
+            
+            // 腮红
+            ctx.fillStyle = 'rgba(255,100,100,0.3)';
+            ctx.fillRect(-6, -4, 3, 2);
+            ctx.fillRect(3, -4, 3, 2);
+            
+        } else if (this.facing === 'back') {
+            // 背面全是头发
+            ctx.fillStyle = this.config.hair;
+            ctx.fillRect(-headW/2, -headH, headW, headH);
+            
+        } else if (this.facing === 'left') {
+            ctx.fillRect(-headW/2, -headH, headW-4, headH); // 头发盖住后脑勺
+            ctx.fillStyle = '#111'; // 眼睛
+            ctx.fillRect(-5, -8, 2, 3);
+            ctx.fillStyle = '#ffceb4'; // 鼻子
+            ctx.fillRect(-9, -6, 2, 2);
+            
+        } else if (this.facing === 'right') {
+            ctx.fillRect(-headW/2 + 4, -headH, headW-4, headH); // 头发盖住后脑勺
+            ctx.fillStyle = '#111'; // 眼睛
+            ctx.fillRect(3, -8, 2, 3);
+            ctx.fillStyle = '#ffceb4'; // 鼻子
+            ctx.fillRect(7, -6, 2, 2);
+        }
+
+        // --- 专属配饰 ---
+        if (this.config.accessory === 'beret') { // 贝雷帽
+            ctx.fillStyle = '#cf2a27';
+            ctx.fillRect(-10, -headH - 4, 18, 5);
+            ctx.fillStyle = '#111';
+            ctx.fillRect(6, -headH - 6, 3, 3);
+        } else if (this.config.accessory === 'glasses') { // 眼镜
+            if (this.facing === 'front') {
+                ctx.fillStyle = 'rgba(255,255,255,0.6)';
+                ctx.fillRect(-6, -9, 5, 4);
+                ctx.fillRect(1, -9, 5, 4);
+                ctx.fillStyle = '#111'; // 框
+                ctx.fillRect(-7, -10, 7, 1);
+                ctx.fillRect(0, -10, 7, 1);
+            }
+        } else if (this.config.accessory === 'hair') { // 长发
+            ctx.fillStyle = this.config.hair;
+            if (this.facing === 'front' || this.facing === 'back') {
+                ctx.fillRect(-headW/2 - 2, -headH, 4, headH + 8);
+                ctx.fillRect(headW/2 - 2, -headH, 4, headH + 8);
+            }
+        } else if (this.config.accessory === 'pencil') { // 笔
+            if (this.facing === 'front' || this.facing === 'right') {
+                ctx.fillStyle = '#e5c07b';
+                ctx.fillRect(6, 4, 10, 2);
+                ctx.fillStyle = '#e06c75'; // 橡皮头
+                ctx.fillRect(16, 4, 3, 2);
+            }
+        } else if (this.config.accessory === 'headphones') { // 耳机
+            ctx.fillStyle = '#1e1e24';
+            ctx.fillRect(-headW/2 - 2, -headH - 3, headW + 4, 3); // 头带
+            if (this.facing !== 'back') {
+                ctx.fillRect(-headW/2 - 3, -8, 4, 8); // 左耳罩
+                ctx.fillRect(headW/2 - 1, -8, 4, 8); // 右耳罩
+            }
+        }
+
+        // --- 绘制语音气泡 ---
+        if (this.speechBubble) {
+            ctx.translate(0, -headH - 10); // 移到头顶上方
+            
+            ctx.font = 'bold 12px "Noto Sans SC"';
+            const padding = 8;
+            const metrics = ctx.measureText(this.speechBubble);
+            const w = metrics.width + padding * 2;
+            const h = 24;
+            
+            // 气泡阴影
+            ctx.fillStyle = 'rgba(0,0,0,0.2)';
+            ctx.beginPath(); ctx.roundRect(-w/2 + 2, -h + 2, w, h, 6); ctx.fill();
+            
+            // 气泡本体
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath(); ctx.roundRect(-w/2, -h, w, h, 6); ctx.fill();
+            
+            // 气泡尾巴
+            ctx.beginPath();
+            ctx.moveTo(-4, 0); ctx.lineTo(4, 0); ctx.lineTo(0, 5); ctx.fill();
+
+            // 文字
+            ctx.fillStyle = '#1e1e24';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(this.speechBubble, 0, -h/2);
+        }
+
+        ctx.restore();
+    }
+}
+
+// --- 环境渲染辅助函数 ---
+
+function drawFloor() {
+    // 基础颜色
+    ctx.fillStyle = '#242533';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    
+    // 木地板纹理 (交错线条)
+    ctx.fillStyle = '#2a2b3c';
+    for (let i = 0; i < canvas.height; i += 16) {
+        ctx.fillRect(0, i, canvas.width, 1);
+        for(let j=0; j < canvas.width; j += 64) {
+            let offset = (i % 32 === 0) ? 0 : 32;
+            ctx.fillRect(j + offset, i, 1, 16);
+        }
+    }
+
+    // 墙壁区域
+    const wallHeight = 100;
+    ctx.fillStyle = '#1d1e29'; // 墙面暗色
+    ctx.fillRect(0, 0, canvas.width, wallHeight);
+    
+    // 墙裙/护墙板
+    ctx.fillStyle = '#32344a';
+    ctx.fillRect(0, wallHeight - 20, canvas.width, 20);
+    ctx.fillStyle = '#1a1b26'; // 墙裙阴影线
+    ctx.fillRect(0, wallHeight, canvas.width, 2);
+
+    // 墙上装饰 - 白板
+    ctx.fillStyle = '#e2e8f0';
+    ctx.fillRect(canvas.width/2 - 60, 20, 120, 50);
+    ctx.fillStyle = '#94a3b8'; // 边框
+    ctx.fillRect(canvas.width/2 - 62, 18, 124, 2);
+    ctx.fillRect(canvas.width/2 - 62, 70, 124, 2);
+    ctx.fillRect(canvas.width/2 - 62, 18, 2, 54);
+    ctx.fillRect(canvas.width/2 + 60, 18, 2, 54);
+    // 白板内容(像素乱码)
+    ctx.fillStyle = '#ef4444'; ctx.fillRect(canvas.width/2 - 50, 30, 20, 2);
+    ctx.fillStyle = '#3b82f6'; ctx.fillRect(canvas.width/2 - 50, 36, 40, 2);
+    ctx.fillStyle = '#22c55e'; ctx.fillRect(canvas.width/2 - 50, 42, 30, 2);
+
+    // 休息区地毯
+    const rx = 280, ry = 480, rw = 240, rh = 100;
+    ctx.fillStyle = '#3b4252'; // 地毯底色
+    ctx.beginPath(); ctx.roundRect(rx, ry, rw, rh, 10); ctx.fill();
+    ctx.strokeStyle = '#4c566a';
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.roundRect(rx+4, ry+4, rw-8, rh-8, 6); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.1)';
+    ctx.font = '10px "Press Start 2P"';
+    ctx.fillText('COFFEE BREAK', rx + rw/2 - 55, ry + rh/2 + 5);
+}
+
+function drawPlant(x, y) {
+    ctx.fillStyle = '#8fbcbb'; // 花盆
+    ctx.fillRect(x, y, 16, 12);
+    ctx.fillStyle = '#4c566a'; // 花盆阴影
+    ctx.fillRect(x, y+8, 16, 4);
+    
+    ctx.fillStyle = '#a3be8c'; // 叶子
+    ctx.beginPath(); ctx.arc(x + 8, y - 6, 10, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 2, y - 2, 8, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 14, y - 2, 8, 0, Math.PI*2); ctx.fill();
+}
+
+function drawDesk(config, agent) {
+    const dx = config.deskX;
+    const dy = config.deskY;
+    
+    // 阴影
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.beginPath(); ctx.ellipse(dx, dy + 15, 45, 12, 0, 0, Math.PI*2); ctx.fill();
+
+    // 椅子 (如果有人在工作，椅子藏在桌下，否则画在外面)
+    if (!agent || agent.state !== 'working') {
+        ctx.fillStyle = '#4c566a';
+        ctx.fillRect(dx - 12, dy + 15, 24, 6); // 座垫
+        ctx.fillRect(dx - 10, dy - 5, 20, 20); // 靠背
+        ctx.fillStyle = '#2e3440';
+        ctx.fillRect(dx - 2, dy + 21, 4, 10);  // 椅子腿
+    }
+
+    // 办公桌
+    const deskW = 70, deskH = 30;
+    ctx.fillStyle = '#d08770'; // 桌面高光
+    ctx.fillRect(dx - deskW/2, dy - 15, deskW, deskH);
+    ctx.fillStyle = '#bf616a'; // 桌侧面(阴影)
+    ctx.fillRect(dx - deskW/2, dy + 15, deskW, 6);
+    
+    // 桌腿
+    ctx.fillStyle = '#3b4252';
+    ctx.fillRect(dx - deskW/2 + 4, dy + 15, 4, 14);
+    ctx.fillRect(dx + deskW/2 - 8, dy + 15, 4, 14);
+
+    // 桌面装饰
+    // 1. 咖啡杯
+    ctx.fillStyle = '#eceff4';
+    ctx.fillRect(dx + 20, dy - 5, 6, 8);
+    ctx.fillStyle = '#5e81ac'; // 杯身条纹
+    ctx.fillRect(dx + 20, dy, 6, 2);
+
+    // 2. 文件夹/画板 (根据角色不同)
+    if (config.name === '分镜师' || config.name === '分镜画师') {
+        ctx.fillStyle = '#ebcb8b'; // 黄色文件夹
+        ctx.fillRect(dx - 28, dy - 8, 14, 18);
+        ctx.fillStyle = '#fff'; ctx.fillRect(dx - 26, dy - 6, 10, 14);
+    } else {
+        drawPlant(dx - 32, dy - 18); // 其他人桌上放绿植
+    }
+
+    // 3. 电脑显示器
+    ctx.fillStyle = '#e5e9f0'; // 显示器背面/底座
+    ctx.fillRect(dx - 5, dy - 8, 10, 8); // 底座
+    ctx.fillRect(dx - 15, dy - 10, 30, 4); // 键盘
+    
+    ctx.fillStyle = '#2e3440'; // 显示器边框
+    ctx.fillRect(dx - 18, dy - 30, 36, 24);
+    
+    // 屏幕光影逻辑
+    if (agent && agent.state === 'working') {
+        ctx.fillStyle = '#88c0d0'; // 亮屏
+        ctx.fillRect(dx - 16, dy - 28, 32, 20);
+        
+        // 屏幕代码滚动假象
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        ctx.fillRect(dx - 14, dy - 26, 20, 2);
+        ctx.fillRect(dx - 14, dy - 22, 28, 2);
+        ctx.fillRect(dx - 14, dy - 18, 15, 2);
+
+        // 桌面发光 (核心氛围增强)
+        ctx.save();
+        ctx.globalCompositeOperation = 'screen';
+        const gradient = ctx.createRadialGradient(dx, dy-10, 10, dx, dy-10, 40);
+        gradient.addColorStop(0, 'rgba(136, 192, 208, 0.4)');
+        gradient.addColorStop(1, 'rgba(136, 192, 208, 0)');
+        ctx.fillStyle = gradient;
+        ctx.beginPath(); ctx.arc(dx, dy-10, 40, 0, Math.PI*2); ctx.fill();
+        ctx.restore();
+    } else {
+        ctx.fillStyle = '#111'; // 黑屏
+        ctx.fillRect(dx - 16, dy - 28, 32, 20);
+    }
+
+    // 名字标签
+    ctx.fillStyle = 'rgba(26, 27, 38, 0.8)';
+    ctx.beginPath(); ctx.roundRect(dx - 25, dy + 25, 50, 14, 4); ctx.fill();
+    ctx.fillStyle = config.color;
+    ctx.font = 'bold 9px "Noto Sans SC"';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(config.name, dx, dy + 32);
+}
+
+function drawEnvironment() {
+    drawFloor();
+    
+    // 提取所有工作台配置
+    const configs = Object.values(ROLE_CONFIGS);
+    
+    // 按 Y 坐标排序渲染桌子，确保纵深关系
+    configs.sort((a, b) => a.deskY - b.deskY);
+    
+    configs.forEach(config => {
+        const owner = agents.find(a => a.config.name === config.name);
+        drawDesk(config, owner);
+    });
+}
+
+// 初始化
+function init() {
+    for (const [id, config] of Object.entries(ROLE_CONFIGS)) {
+        agents.push(new Agent(id, config));
+    }
+    addLog('系统初始化完毕。Nord 色调已加载。', '#a3be8c');
+    addLog('团队当前处于 [休息/待机] 状态。', '#81a1c1');
+}
+
+// 主循环
+let lastTime = performance.now();
+function gameLoop(now) {
+    const dt = now - lastTime;
+    lastTime = now;
+
+    // 清除画布
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // 1. 绘制静态背景和后面的桌子
+    drawFloor();
+    
+    // 2. 收集所有需要绘制的实体（角色 + 桌子），按 Y 坐标排序实现伪3D遮挡
+    let renderables = [];
+    
+    // 放入桌子
+    Object.values(ROLE_CONFIGS).forEach(conf => {
+        renderables.push({ type: 'desk', y: conf.deskY, data: conf });
+    });
+    // 放入角色
+    agents.forEach(agent => {
+        // 稍微偏移角色的 Y 以便判断与桌子的前后关系
+        renderables.push({ type: 'agent', y: agent.y, data: agent });
+    });
+
+    renderables.sort((a, b) => a.y - b.y);
+
+    // 3. 按顺序渲染
+    renderables.forEach(item => {
+        if (item.type === 'desk') {
+            const owner = agents.find(a => a.config.name === item.data.name);
+            drawDesk(item.data, owner);
+        } else if (item.type === 'agent') {
+            item.data.update(dt);
+            item.data.draw(ctx);
+        }
+    });
+
+    // 4. 更新和绘制顶层粒子特效
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.update();
+        p.draw(ctx);
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    // 全局暗角效果 (Canvas 内实现，更自然)
+    const gradient = ctx.createRadialGradient(canvas.width/2, canvas.height/2, canvas.height/3, canvas.width/2, canvas.height/2, canvas.width);
+    gradient.addColorStop(0, 'rgba(0,0,0,0)');
+    gradient.addColorStop(1, 'rgba(0,0,0,0.6)');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    requestAnimationFrame(gameLoop);
+}
+
+// --- 交互逻辑 ---
+
+document.getElementById('btn-action').addEventListener('click', () => {
+    if (officeState === 'WORKING') return;
+    
+    officeState = 'MEETING';
+    addLog('【Action】指令下达，开始分配任务...', '#e06c75');
+    
+    const director = agents.find(a => a.id === 'director');
+    
+    director.state = 'going_to_desk';
+    director.targetX = director.config.deskX;
+    director.targetY = director.config.deskY;
+    director.say("各就各位，新项目启动！", 3500);
+    
+    agents.forEach(a => {
+        if(a.id !== 'director') {
+            particles.push(new Particle(a.x, a.y - 40, 'idea', '#e5c07b'));
+            a.facing = director.x > a.x ? 'right' : 'left'; 
+        }
+    });
+
+    setTimeout(() => {
+        officeState = 'WORKING';
+        agents.forEach(a => {
+            if (a.id !== 'director') {
+                a.state = 'going_to_desk';
+                // 站在桌子前面一点
+                a.targetX = a.config.deskX;
+                a.targetY = a.config.deskY + 12; 
+                a.say("收到！", 2000);
+            }
+        });
+        addLog('团队已进入 [工作/产出] 状态。', '#61afef');
+    }, 1500);
+});
+
+document.getElementById('btn-rest').addEventListener('click', () => {
+    if (officeState === 'IDLE') return;
+    
+    officeState = 'IDLE';
+    addLog('【Rest】进入休息时间，恢复体力。', '#c678dd');
+    
+    const director = agents.find(a => a.id === 'director');
+    director.say("进度不错，大家休息一下吧。", 3000);
+
+    agents.forEach(a => {
+        a.state = 'wander';
+        a.targetX = rand(a.loungeArea.minX, a.loungeArea.maxX);
+        a.targetY = rand(a.loungeArea.minY, a.loungeArea.maxY);
+    });
+});
+
+// 启动
+init();
+requestAnimationFrame(gameLoop);
+
+</script>
+</body>
+</html>

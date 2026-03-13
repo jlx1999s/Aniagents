@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 function StatusChip({ status }) {
   const statusText = {
@@ -11,10 +11,14 @@ function StatusChip({ status }) {
   return <span className={`project-status-chip ${status}`}>{statusText[status] || status}</span>;
 }
 
-function ProjectCard({ item, isActive, onOpen, onAdvance }) {
+function ProjectCard({ item, isActive, selected, onSelect, onOpen, onAdvance, onDelete }) {
   return (
     <div className={`project-card ${isActive ? 'active' : ''}`}>
       <div className="project-card-top">
+        <label className="project-select-toggle">
+          <input type="checkbox" checked={selected} onChange={(event) => onSelect(item.projectId, event.target.checked)} />
+          <span>选择</span>
+        </label>
         <div className="project-id">{item.projectId}</div>
         <StatusChip status={item.status} />
       </div>
@@ -32,17 +36,22 @@ function ProjectCard({ item, isActive, onOpen, onAdvance }) {
         <button type="button" className="review-btn" onClick={() => onAdvance(item.projectId)}>
           推进一步
         </button>
+        <button type="button" className="review-btn" onClick={() => onDelete(item.projectId)}>
+          删除
+        </button>
       </div>
     </div>
   );
 }
 
 export default function ProjectManager({
+  projectIds,
   projectSummaries,
   snapshot,
   activeProjectId,
   draftPrompt,
   loadingProjects,
+  projectStats,
   actions,
   onOpenProject,
   errorMessage,
@@ -52,6 +61,8 @@ export default function ProjectManager({
   const [busyProjectId, setBusyProjectId] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState('');
+  const [selectedProjectIds, setSelectedProjectIds] = useState([]);
+  const selectAllRef = useRef(null);
   const effectiveProjects = useMemo(() => {
     if (projectSummaries.length > 0) {
       return projectSummaries;
@@ -73,13 +84,101 @@ export default function ProjectManager({
     );
   }, [keyword, effectiveProjects]);
 
+  const totalProjectCount =
+    typeof projectStats?.total === 'number'
+      ? projectStats.total
+      : projectIds.length > 0
+        ? projectIds.length
+        : effectiveProjects.length;
+
   const stats = useMemo(() => {
-    const total = effectiveProjects.length;
-    const running = effectiveProjects.filter((item) => item.status === 'running').length;
-    const review = effectiveProjects.filter((item) => item.status === 'waiting_review').length;
-    const completed = effectiveProjects.filter((item) => item.status === 'completed').length;
+    const total = typeof projectStats?.total === 'number' ? projectStats.total : totalProjectCount;
+    const running =
+      typeof projectStats?.running === 'number'
+        ? projectStats.running
+        : effectiveProjects.filter((item) => item.status === 'running').length;
+    const review =
+      typeof projectStats?.waiting_review === 'number'
+        ? projectStats.waiting_review
+        : effectiveProjects.filter((item) => item.status === 'waiting_review').length;
+    const completed =
+      typeof projectStats?.completed === 'number'
+        ? projectStats.completed
+        : effectiveProjects.filter((item) => item.status === 'completed').length;
     return { total, running, review, completed };
-  }, [effectiveProjects]);
+  }, [effectiveProjects, totalProjectCount, projectStats]);
+
+  const visibleProjectIds = useMemo(() => filtered.map((item) => item.projectId), [filtered]);
+  const selectedVisibleCount = useMemo(
+    () => visibleProjectIds.filter((id) => selectedProjectIds.includes(id)).length,
+    [visibleProjectIds, selectedProjectIds]
+  );
+  const allVisibleSelected = visibleProjectIds.length > 0 && selectedVisibleCount === visibleProjectIds.length;
+  const selectedCount = selectedProjectIds.length;
+
+  useEffect(() => {
+    if (!selectAllRef.current) {
+      return;
+    }
+    const partial = selectedVisibleCount > 0 && selectedVisibleCount < visibleProjectIds.length;
+    selectAllRef.current.indeterminate = partial;
+  }, [selectedVisibleCount, visibleProjectIds.length]);
+
+  const toggleSelectAllVisible = (checked) => {
+    if (checked) {
+      setSelectedProjectIds((prev) => [...new Set([...prev, ...visibleProjectIds])]);
+      return;
+    }
+    setSelectedProjectIds((prev) => prev.filter((id) => !visibleProjectIds.includes(id)));
+  };
+
+  const handleDeleteSelected = async () => {
+    const ids = [...new Set(selectedProjectIds)].filter(Boolean);
+    if (ids.length === 0) {
+      return;
+    }
+    const confirmed = window.confirm(
+      ids.length === 1
+        ? `确认删除项目 ${ids[0]} 吗？删除后不可恢复。`
+        : `确认删除选中的 ${ids.length} 个项目吗？删除后不可恢复。`
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      setLocalError('');
+      setSubmitting(true);
+      await actions.deleteProjects(ids);
+      setSelectedProjectIds((prev) => prev.filter((id) => !ids.includes(id)));
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : '删除项目失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleDeleteSingle = async (projectId) => {
+    const value = String(projectId || '').trim();
+    if (!value) {
+      return;
+    }
+    const confirmed = window.confirm(`确认删除项目 ${value} 吗？删除后不可恢复。`);
+    if (!confirmed) {
+      return;
+    }
+    try {
+      setLocalError('');
+      setSubmitting(true);
+      setBusyProjectId(value);
+      await actions.deleteProjects([value]);
+      setSelectedProjectIds((prev) => prev.filter((id) => id !== value));
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : '删除项目失败');
+    } finally {
+      setBusyProjectId('');
+      setSubmitting(false);
+    }
+  };
 
   return (
     <section className="project-manager">
@@ -156,7 +255,38 @@ export default function ProjectManager({
           value={keyword}
           onChange={(event) => setKeyword(event.target.value)}
         />
-        <div className="project-filter-hint">{loadingProjects ? '加载中...' : `共 ${filtered.length} 条`}</div>
+        <div className="project-filter-hint">
+          {loadingProjects
+            ? '加载中...'
+            : keyword.trim()
+              ? `当前筛选 ${filtered.length} 条（已加载 ${effectiveProjects.length} / 总 ${totalProjectCount}）`
+              : `已加载 ${effectiveProjects.length} / 总 ${totalProjectCount}`}
+        </div>
+      </div>
+
+      <div className="project-filter-row">
+        <label className="project-select-toggle">
+          <input
+            type="checkbox"
+            ref={selectAllRef}
+            checked={allVisibleSelected}
+            onChange={(event) => toggleSelectAllVisible(event.target.checked)}
+            disabled={visibleProjectIds.length === 0 || submitting}
+          />
+          <span>全选当前筛选</span>
+        </label>
+        <div className="project-filter-hint">已选 {selectedCount} 条</div>
+        <button type="button" className="review-btn" disabled={selectedCount === 0 || submitting} onClick={handleDeleteSelected}>
+          删除选中
+        </button>
+        <button
+          type="button"
+          className="review-btn"
+          disabled={selectedCount === 0 || submitting}
+          onClick={() => setSelectedProjectIds([])}
+        >
+          清空选择
+        </button>
       </div>
 
       <div className="project-list-grid">
@@ -166,6 +296,15 @@ export default function ProjectManager({
               <ProjectCard
                 item={item}
                 isActive={item.projectId === activeProjectId}
+                selected={selectedProjectIds.includes(item.projectId)}
+                onSelect={(projectId, checked) => {
+                  setSelectedProjectIds((prev) => {
+                    if (checked) {
+                      return [...new Set([...prev, projectId])];
+                    }
+                    return prev.filter((itemId) => itemId !== projectId);
+                  });
+                }}
                 onOpen={async (projectId) => {
                   try {
                     setLocalError('');
@@ -188,6 +327,7 @@ export default function ProjectManager({
                     setBusyProjectId('');
                   }
                 }}
+                onDelete={handleDeleteSingle}
               />
               {busyProjectId === item.projectId ? <div className="project-card-loading">处理中...</div> : null}
             </div>

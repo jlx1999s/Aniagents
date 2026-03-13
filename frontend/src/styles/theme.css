@@ -1,9 +1,10 @@
 :root {
-  --bg: #030303;
-  --panel: #0f0f11;
-  --line: #222225;
-  --text-muted: #6b6c70;
-  --text-bright: #fff7e0;
-  --text-gold: #c9a881;
-  --chip-bg: rgba(10, 10, 12, 0.6);
+  --bg: #020a14;
+  --panel: rgba(8, 28, 44, 0.62);
+  --panel-strong: rgba(7, 24, 38, 0.8);
+  --line: rgba(145, 210, 242, 0.24);
+  --text-muted: #8ba8c9;
+  --text-bright: #e4f6ff;
+  --text-gold: #74c7e6;
+  --chip-bg: rgba(11, 35, 52, 0.48);
 }

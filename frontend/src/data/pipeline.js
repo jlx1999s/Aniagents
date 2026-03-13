@@ -1,4 +1,4 @@
-export const navLinks = ['总览', '项目', '流水线', '资产', '质检'];
+export const navLinks = ['总览', '项目', '流水线', '资产', '质检', '设置'];
 
 export const pipelineStages = [
   {
