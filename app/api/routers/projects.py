@@ -1,5 +1,5 @@
 import asyncio
-from typing import List
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -114,6 +114,8 @@ def submit_review(project_id: str, payload: ReviewRequest) -> ProjectSnapshot:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project_not_found") from exc
     except ValueError as exc:
+        if str(exc) == "review_not_required":
+            return ProjectSnapshot(**orchestrator.snapshot(project_id))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -141,6 +143,22 @@ def chat_project(project_id: str, payload: ChatRequest) -> ProjectSnapshot:
         raise HTTPException(status_code=404, detail="project_not_found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{project_id}/intent-router-policy")
+def read_project_intent_router_policy(project_id: str) -> Dict[str, Any]:
+    try:
+        return orchestrator.get_project_intent_router_policy(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project_not_found") from exc
+
+
+@router.put("/{project_id}/intent-router-policy")
+def update_project_intent_router_policy(project_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return orchestrator.set_project_intent_router_policy(project_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project_not_found") from exc
 
 
 @router.get("/{project_id}/stream")

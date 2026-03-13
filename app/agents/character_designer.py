@@ -27,7 +27,9 @@ def character_designer_agent(state: ManjuState) -> ManjuState:
         qa_score=None if qa_result["status"] != "ok" else 0.9,
     )
     state["global_style"] = style
-    state["character_assets"] = {"main_character": asset}
+    character_assets = dict(state.get("character_assets") or {})
+    character_assets[f"main_character_{len(character_assets) + 1}"] = asset
+    state["character_assets"] = character_assets
     state["approval_required"] = True
     state["approval_stage"] = "style"
     state["current_node"] = NODE_CHARACTER_DESIGNER

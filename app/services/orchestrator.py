@@ -20,10 +20,11 @@ from app.graph.routing import (
     NODE_STORYBOARD_ARTIST,
 )
 from app.graph.state import ManjuState, create_initial_state
+from app.services.intent_router_policy import get_intent_router_policy, normalize_intent_router_policy
 from app.services.manager_agent import ManagerAgent
 from app.services.review_gateway import ReviewGateway
 from app.services.tool_executor import ToolizedAgentExecutor
-from app.tools.mcp_client import generate_structured_role_reply_tool
+from app.tools.mcp_client import generate_intent_decision_tool, generate_structured_role_reply_tool
 
 AGENT_SEQUENCE = [
     (NODE_SCRIPTWRITER, scriptwriter_agent, "分镜拆解"),
@@ -85,6 +86,8 @@ class ProjectRuntime:
     review_logs: List[Dict[str, str]] = field(default_factory=list)
     chat_logs: List[Dict[str, str]] = field(default_factory=list)
     activity_logs: List[Dict[str, object]] = field(default_factory=list)
+    conversation_round: int = 1
+    round_history: List[Dict[str, object]] = field(default_factory=list)
 
 
 class ProjectOrchestrator:
@@ -104,6 +107,29 @@ class ProjectOrchestrator:
             self._init_db_locked()
             self._load_store_locked()
 
+    def _allowed_chat_intents(self) -> List[str]:
+        return [
+            "reject_project",
+            "approve_review",
+            "revise_style",
+            "revise_existing",
+            "revise_script",
+            "new_creation",
+            "continue_pipeline",
+            "prompt_update",
+            "chat_only",
+        ]
+
+    def _runtime_intent_router_policy(self, runtime: ProjectRuntime) -> Dict[str, Any]:
+        policy = runtime.state.get("intent_router_policy")
+        if isinstance(policy, dict):
+            normalized = normalize_intent_router_policy(policy)
+            runtime.state["intent_router_policy"] = normalized
+            return normalized
+        default_policy = normalize_intent_router_policy(get_intent_router_policy())
+        runtime.state["intent_router_policy"] = default_policy
+        return default_policy
+
     def _serialize_runtime(self, runtime: ProjectRuntime) -> Dict[str, Any]:
         return {
             "state": runtime.state,
@@ -116,6 +142,8 @@ class ProjectOrchestrator:
             "review_logs": runtime.review_logs,
             "chat_logs": runtime.chat_logs,
             "activity_logs": runtime.activity_logs,
+            "conversation_round": runtime.conversation_round,
+            "round_history": runtime.round_history,
         }
 
     def _deserialize_runtime(self, payload: Dict[str, Any]) -> Optional[ProjectRuntime]:
@@ -136,6 +164,8 @@ class ProjectOrchestrator:
             review_logs=list(payload.get("review_logs", [])),
             chat_logs=list(payload.get("chat_logs", [])),
             activity_logs=list(payload.get("activity_logs", [])),
+            conversation_round=max(1, int(payload.get("conversation_round", 1))),
+            round_history=list(payload.get("round_history", [])),
         )
 
     def _db_connect_locked(self) -> sqlite3.Connection:
@@ -237,6 +267,7 @@ class ProjectOrchestrator:
         with self._lock:
             state = create_initial_state(user_prompt=user_prompt)
             runtime = ProjectRuntime(state=state)
+            runtime.state["intent_router_policy"] = normalize_intent_router_policy(get_intent_router_policy())
             self._append_history(runtime, "project_created")
             self._append_chat_log(runtime, "用户", user_prompt)
             self._append_chat_log(runtime, "Agent", self._agent_guidance(runtime))
@@ -247,6 +278,32 @@ class ProjectOrchestrator:
     def get_runtime(self, project_id: str) -> Optional[ProjectRuntime]:
         with self._lock:
             return self._store.get(project_id)
+
+    def get_project_intent_router_policy(self, project_id: str) -> Dict[str, Any]:
+        with self._lock:
+            runtime = self._store.get(project_id)
+            if runtime is None:
+                raise KeyError(project_id)
+            policy = self._runtime_intent_router_policy(runtime)
+            self._persist_store_locked()
+            return json.loads(json.dumps(policy))
+
+    def set_project_intent_router_policy(self, project_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            runtime = self._store.get(project_id)
+            if runtime is None:
+                raise KeyError(project_id)
+            existing = self._runtime_intent_router_policy(runtime)
+            merged = {**existing, **(payload if isinstance(payload, dict) else {})}
+            merged_rules = dict(existing.get("rules", {}))
+            incoming_rules = payload.get("rules") if isinstance(payload, dict) else None
+            if isinstance(incoming_rules, dict):
+                merged_rules.update(incoming_rules)
+            merged["rules"] = merged_rules
+            normalized = normalize_intent_router_policy(merged)
+            runtime.state["intent_router_policy"] = normalized
+            self._persist_store_locked()
+            return json.loads(json.dumps(normalized))
 
     def list_project_ids(self) -> List[str]:
         with self._lock:
@@ -332,32 +389,46 @@ class ProjectOrchestrator:
         return plan
 
     def _storyboard_table(self, state: ManjuState) -> List[Dict[str, str]]:
-        script_data = state.get("script_data") or {}
-        scenes = script_data.get("scenes")
         rows: List[Dict[str, str]] = []
-        if isinstance(scenes, list):
-            for index, scene in enumerate(scenes, start=1):
+        script_data = state.get("script_data") or {}
+        script_history = state.get("script_history") or []
+        scene_groups: List[List[Dict[str, Any]]] = []
+        if isinstance(script_history, list):
+            for item in script_history:
+                if not isinstance(item, dict):
+                    continue
+                scenes = item.get("scenes")
+                if isinstance(scenes, list) and scenes:
+                    scene_groups.append(scenes)
+        if isinstance(script_data, dict):
+            scenes = script_data.get("scenes")
+            if isinstance(scenes, list) and scenes:
+                if not scene_groups or scene_groups[-1] is not scenes:
+                    scene_groups.append(scenes)
+        shot_index = 1
+        for scenes in scene_groups:
+            for scene in scenes:
                 if not isinstance(scene, dict):
                     continue
-                shot_no = str(scene.get("index") or index)
                 beat = str(
                     scene.get("summary")
                     or scene.get("beat")
                     or scene.get("description")
-                    or f"镜头 {shot_no}"
+                    or f"镜头 {shot_index}"
                 )
                 visual = str(scene.get("visual") or scene.get("composition") or beat)
                 dialogue = str(scene.get("dialogue") or scene.get("voiceover") or "")
                 duration = str(scene.get("duration") or "3s")
                 rows.append(
                     {
-                        "shotNo": shot_no,
+                        "shotNo": str(shot_index),
                         "beat": beat[:80],
                         "visual": visual[:100],
                         "dialogue": dialogue[:80],
                         "duration": duration,
                     }
                 )
+                shot_index += 1
         if rows:
             return rows
         raw = script_data.get("raw")
@@ -381,7 +452,7 @@ class ProjectOrchestrator:
             )
         if rows:
             return rows
-        has_script_attempt = bool(script_data) or state.get("route_reason") == NODE_SCRIPTWRITER
+        has_script_attempt = bool(script_data) or bool(script_history) or state.get("route_reason") == NODE_SCRIPTWRITER
         if not has_script_attempt:
             return rows
         prompt = str(state.get("user_prompt") or "").strip()
@@ -651,6 +722,261 @@ class ProjectOrchestrator:
             return NODE_ANIMATION_ARTIST
         return None
 
+    def _contains_any(self, text: str, keywords: List[str]) -> bool:
+        return any(keyword in text for keyword in keywords)
+
+    def _is_new_creation_intent(self, text: str) -> bool:
+        lower = text.lower()
+        keywords = [
+            "新剧本",
+            "新的剧本",
+            "新故事",
+            "新剧情",
+            "创建",
+            "新建",
+            "重新开始",
+            "从头开始",
+            "开一个新",
+            "开个新",
+            "重启创作",
+            "写一段",
+            "写个剧本",
+            "写一个剧本",
+            "再来一段",
+            "new script",
+            "new story",
+            "create script",
+        ]
+        return self._contains_any(text, keywords) or self._contains_any(lower, keywords)
+
+    def _control_keywords(self) -> List[str]:
+        return [
+            "开始下一阶段",
+            "开始",
+            "继续",
+            "继续生成",
+            "执行当前阶段",
+            "确认",
+            "通过",
+            "重做",
+            "返修",
+            "修改",
+            "风格",
+            "放弃项目",
+            "终止项目",
+        ]
+
+    def _intent_confidence(self, intent: str) -> float:
+        confidence_map = {
+            "reject_project": 0.99,
+            "approve_review": 0.94,
+            "revise_style": 0.93,
+            "revise_existing": 0.9,
+            "revise_script": 0.9,
+            "new_creation": 0.92,
+            "continue_pipeline": 0.88,
+            "prompt_update": 0.86,
+            "chat_only": 0.72,
+        }
+        return confidence_map.get(intent, 0.7)
+
+    def _llm_refine_intent(
+        self,
+        runtime: ProjectRuntime,
+        text: str,
+        rule_intent: str,
+        rule_target: Optional[str],
+        rule_confidence: float,
+    ) -> Dict[str, object]:
+        policy = self._runtime_intent_router_policy(runtime)
+        rules = policy.get("rules", {}) if isinstance(policy, dict) else {}
+        mode = str(rules.get("mode", "hybrid"))
+        try:
+            llm_min_confidence = float(rules.get("llmMinConfidence", 0.75))
+        except Exception:
+            llm_min_confidence = 0.75
+        llm_min_confidence = max(0.0, min(llm_min_confidence, 1.0))
+        try:
+            rule_bypass_threshold = float(rules.get("ruleHighConfidenceBypass", 0.91))
+        except Exception:
+            rule_bypass_threshold = 0.91
+        rule_bypass_threshold = max(0.0, min(rule_bypass_threshold, 1.0))
+        force_rule_when_awaiting_review = bool(rules.get("forceRuleWhenAwaitingReview", True))
+        if mode == "rule_only":
+            return {
+                "intent": rule_intent,
+                "target": rule_target,
+                "confidence": rule_confidence,
+                "reason": "policy_rule_only",
+                "source": "rule_router_v2",
+            }
+        if runtime.awaiting_review and force_rule_when_awaiting_review:
+            return {
+                "intent": rule_intent,
+                "target": rule_target,
+                "confidence": rule_confidence,
+                "reason": "policy_force_rule_awaiting_review",
+                "source": "rule_router_v2",
+            }
+        if mode != "model_first" and rule_confidence >= rule_bypass_threshold:
+            return {
+                "intent": rule_intent,
+                "target": rule_target,
+                "confidence": rule_confidence,
+                "reason": "rule_high_confidence",
+                "source": "rule_router_v2",
+            }
+        if len(text) <= 1:
+            return {
+                "intent": rule_intent,
+                "target": rule_target,
+                "confidence": rule_confidence,
+                "reason": "message_too_short",
+                "source": "rule_router_v2",
+            }
+        current_stage = ""
+        if 0 <= runtime.current_index < len(AGENT_SEQUENCE):
+            current_stage = AGENT_SEQUENCE[runtime.current_index][0]
+        model_result = generate_intent_decision_tool(
+            user_message=text,
+            status=runtime.status,
+            awaiting_review=runtime.awaiting_review,
+            current_stage=current_stage,
+            allowed_intents=self._allowed_chat_intents(),
+            available_nodes=list(STAGE_TO_INDEX.keys()),
+        )
+        model_intent = model_result.get("intent")
+        if not isinstance(model_intent, str) or model_intent not in self._allowed_chat_intents():
+            return {
+                "intent": rule_intent,
+                "target": rule_target,
+                "confidence": rule_confidence,
+                "reason": "llm_invalid_result",
+                "source": "rule_router_v2",
+            }
+        model_target = model_result.get("target_node")
+        if not isinstance(model_target, str) or model_target not in STAGE_TO_INDEX:
+            model_target = None
+        try:
+            model_confidence = float(model_result.get("confidence") or 0.0)
+        except Exception:
+            model_confidence = 0.0
+        model_confidence = max(0.0, min(model_confidence, 1.0))
+        if model_confidence < llm_min_confidence:
+            return {
+                "intent": rule_intent,
+                "target": rule_target,
+                "confidence": rule_confidence,
+                "reason": "llm_low_confidence",
+                "source": "rule_router_v2",
+            }
+        model_reason = str(model_result.get("reason") or "llm_intent")
+        return {
+            "intent": model_intent,
+            "target": model_target,
+            "confidence": model_confidence,
+            "reason": model_reason,
+            "source": "hybrid_router_v3",
+        }
+
+    def _classify_chat_intent(self, runtime: ProjectRuntime, text: str) -> Dict[str, object]:
+        selected_intent = "chat_only"
+        selected_target: Optional[str] = None
+        reason = "default_chat_fallback"
+        if self._contains_any(text, ["放弃项目", "终止项目"]):
+            selected_intent = "reject_project"
+            reason = "matched_reject_keywords"
+        elif runtime.awaiting_review and self._contains_any(text, ["确认风格", "确认", "通过", "继续"]):
+            selected_intent = "approve_review"
+            reason = "awaiting_review_with_approve_keywords"
+        elif runtime.awaiting_review and self._contains_any(text, ["修改风格", "风格", "改成", "换成"]):
+            selected_intent = "revise_style"
+            selected_target = NODE_CHARACTER_DESIGNER
+            reason = "awaiting_review_with_style_keywords"
+        elif self._contains_any(text, ["重做", "返修", "修改"]):
+            selected_intent = "revise_existing"
+            selected_target = self._infer_target_node(text)
+            reason = "matched_revise_keywords"
+        elif (
+            not runtime.awaiting_review
+            and runtime.current_index == STAGE_TO_INDEX[NODE_CHARACTER_DESIGNER]
+            and self._contains_any(text, ["电影感", "镜头", "运镜", "构图", "节奏", "分镜"])
+        ):
+            selected_intent = "revise_script"
+            selected_target = NODE_SCRIPTWRITER
+            reason = "character_stage_with_script_feedback"
+        elif self._is_new_creation_intent(text):
+            selected_intent = "new_creation"
+            selected_target = NODE_SCRIPTWRITER
+            reason = "matched_new_creation_keywords"
+        elif (
+            not runtime.awaiting_review
+            and self._contains_any(text, ["开始下一阶段", "开始", "继续", "继续生成", "执行当前阶段"])
+        ):
+            selected_intent = "continue_pipeline"
+            selected_target = self._next_node(runtime) or NODE_SCRIPTWRITER
+            reason = "matched_continue_keywords"
+        elif (
+            not runtime.awaiting_review
+            and runtime.current_index == STAGE_TO_INDEX[NODE_SCRIPTWRITER]
+            and not self._contains_any(text, self._control_keywords())
+        ):
+            selected_intent = "prompt_update"
+            selected_target = NODE_SCRIPTWRITER
+            reason = "script_stage_free_text_prompt"
+        base_result = {
+            "intent": selected_intent,
+            "target": selected_target,
+            "confidence": self._intent_confidence(selected_intent),
+            "reason": reason,
+            "source": "rule_router_v2",
+        }
+        return self._llm_refine_intent(
+            runtime=runtime,
+            text=text,
+            rule_intent=str(base_result["intent"]),
+            rule_target=base_result["target"] if isinstance(base_result["target"], str) else None,
+            rule_confidence=float(base_result["confidence"]),
+        )
+
+    def _start_new_creation_cycle(self, runtime: ProjectRuntime, prompt: str, operator_id: str) -> None:
+        previous_round_record = {
+            "round": runtime.conversation_round,
+            "prompt": runtime.state.get("user_prompt", ""),
+            "status": runtime.status,
+            "stepCount": runtime.step_count,
+            "endedAt": time.time(),
+        }
+        runtime.round_history.append(previous_round_record)
+        runtime.conversation_round += 1
+        runtime.state["user_prompt"] = prompt
+        runtime.state["current_node"] = ""
+        runtime.state["route_reason"] = None
+        runtime.state["pending_feedback"] = []
+        runtime.state["approval_required"] = False
+        runtime.state["approval_stage"] = None
+        runtime.state["retry_count_by_node"] = {}
+        runtime.state["iteration_count"] = 0
+        runtime.state["errors"] = []
+        runtime.current_index = STAGE_TO_INDEX[NODE_SCRIPTWRITER]
+        runtime.status = "running"
+        runtime.awaiting_review = False
+        runtime.step_count = 0
+        runtime.last_advanced_at = 0.0
+        self._append_review_log(
+            runtime,
+            {
+                "action": "restart",
+                "operator_id": operator_id,
+                "stage": "script",
+                "issue_type": "chat_new_creation",
+                "priority": "high",
+                "message": prompt,
+                "target_node": NODE_SCRIPTWRITER,
+            },
+        )
+        self._append_history(runtime, "chat_new_cycle_started")
+
     def submit_review(
         self,
         project_id: str,
@@ -740,7 +1066,24 @@ class ProjectOrchestrator:
             assistant_target_node: Optional[str] = None
             director_dispatch_required = False
             self._append_chat_log(runtime, operator_id, text)
-            if any(keyword in text for keyword in ["放弃项目", "终止项目"]):
+            intent_result = self._classify_chat_intent(runtime, text)
+            intent = str(intent_result.get("intent") or "chat_only")
+            confidence = float(intent_result.get("confidence") or 0.0)
+            reason = str(intent_result.get("reason") or "")
+            source = str(intent_result.get("source") or "rule_router_v2")
+            self._append_activity(
+                runtime,
+                "intent_router",
+                {
+                    "actor": "意图路由",
+                    "intent": intent,
+                    "confidence": confidence,
+                    "reason": reason,
+                    "source": source,
+                    "round": runtime.conversation_round,
+                },
+            )
+            if intent == "reject_project":
                 runtime.status = "rejected"
                 runtime.awaiting_review = False
                 runtime.state["approval_required"] = False
@@ -758,18 +1101,12 @@ class ProjectOrchestrator:
                 )
                 runtime.state["errors"].append({"node": "Director_Agent", "error": text})
                 self._append_history(runtime, "chat_rejected")
-            elif (
-                not runtime.awaiting_review
-                and runtime.current_index == STAGE_TO_INDEX[NODE_SCRIPTWRITER]
-                and not any(keyword in text for keyword in ["开始", "继续", "确认", "通过", "重做", "返修", "修改"])
-            ):
+            elif intent == "new_creation":
+                self._start_new_creation_cycle(runtime, text, operator_id)
+                assistant_target_node = NODE_SCRIPTWRITER
+                director_dispatch_required = True
+            elif intent == "prompt_update":
                 runtime.state["user_prompt"] = text
-                runtime.state["script_data"] = {}
-                runtime.state["character_assets"] = {}
-                runtime.state["storyboard_frames"] = []
-                runtime.state["video_clips"] = []
-                runtime.state["audio_tracks"] = {}
-                runtime.state["final_video"] = None
                 runtime.state["errors"] = []
                 runtime.current_index = STAGE_TO_INDEX[NODE_SCRIPTWRITER]
                 runtime.status = "running"
@@ -779,11 +1116,7 @@ class ProjectOrchestrator:
                 self._append_history(runtime, "chat_update_prompt")
                 assistant_target_node = NODE_SCRIPTWRITER
                 director_dispatch_required = True
-            elif (
-                not runtime.awaiting_review
-                and runtime.current_index == STAGE_TO_INDEX[NODE_CHARACTER_DESIGNER]
-                and any(keyword in text for keyword in ["电影感", "镜头", "运镜", "构图", "节奏", "分镜"])
-            ):
+            elif intent == "revise_script":
                 runtime.state["global_style"]["script_feedback"] = text
                 runtime.current_index = STAGE_TO_INDEX[NODE_SCRIPTWRITER]
                 self._mark_approval_resolved(runtime)
@@ -803,9 +1136,7 @@ class ProjectOrchestrator:
                 self._append_history(runtime, "chat_revise_script")
                 assistant_target_node = NODE_SCRIPTWRITER
                 director_dispatch_required = True
-            elif runtime.awaiting_review and any(
-                keyword in text for keyword in ["确认风格", "确认", "通过", "继续"]
-            ):
+            elif intent == "approve_review":
                 resolved_stage = runtime.state.get("approval_stage") or ""
                 self._mark_approval_resolved(runtime)
                 runtime.current_index = min(runtime.current_index + 1, len(AGENT_SEQUENCE))
@@ -824,9 +1155,7 @@ class ProjectOrchestrator:
                 self._append_history(runtime, "chat_approved")
                 assistant_target_node = self._next_node(runtime)
                 director_dispatch_required = assistant_target_node is not None
-            elif runtime.awaiting_review and any(
-                keyword in text for keyword in ["修改风格", "风格", "改成", "换成"]
-            ):
+            elif intent == "revise_style":
                 runtime.state["global_style"]["user_feedback"] = text
                 runtime.current_index = STAGE_TO_INDEX[NODE_CHARACTER_DESIGNER]
                 self._mark_approval_resolved(runtime)
@@ -846,8 +1175,10 @@ class ProjectOrchestrator:
                 self._append_history(runtime, "chat_revise_style")
                 assistant_target_node = NODE_CHARACTER_DESIGNER
                 director_dispatch_required = True
-            elif any(keyword in text for keyword in ["重做", "返修", "修改"]):
-                target = self._infer_target_node(text) or self._next_node(runtime) or NODE_STORYBOARD_ARTIST
+            elif intent == "revise_existing":
+                target = intent_result.get("target")
+                if not isinstance(target, str) or target not in STAGE_TO_INDEX:
+                    target = self._next_node(runtime) or NODE_STORYBOARD_ARTIST
                 runtime.current_index = STAGE_TO_INDEX[target]
                 self._mark_approval_resolved(runtime)
                 runtime.status = "running"
@@ -866,12 +1197,11 @@ class ProjectOrchestrator:
                 self._append_history(runtime, f"chat_revise:{target}")
                 assistant_target_node = target
                 director_dispatch_required = True
-            elif (
-                not runtime.awaiting_review
-                and any(keyword in text for keyword in ["开始下一阶段", "开始", "继续", "继续生成", "执行当前阶段"])
-            ):
+            elif intent == "continue_pipeline":
                 runtime.status = "running"
-                target = self._next_node(runtime) or NODE_SCRIPTWRITER
+                target = intent_result.get("target")
+                if not isinstance(target, str) or target not in STAGE_TO_INDEX:
+                    target = self._next_node(runtime) or NODE_SCRIPTWRITER
                 assistant_target_node = target
                 director_dispatch_required = True
             elif runtime.status not in {"completed", "rejected", "failed"}:
@@ -1102,6 +1432,12 @@ class ProjectOrchestrator:
             }
             execution_plan = self._execution_plan(runtime)
             suggested_commands = self._suggested_commands(runtime)
+            intent_router_policy = self._runtime_intent_router_policy(runtime)
+            intent_logs = [
+                item["payload"]
+                for item in runtime.activity_logs
+                if item.get("kind") == "intent_router" and isinstance(item.get("payload"), dict)
+            ]
             return {
                 "projectId": state["project_id"],
                 "prompt": state["user_prompt"],
@@ -1130,6 +1466,10 @@ class ProjectOrchestrator:
                 "executionPlanSummary": self._execution_plan_summary(runtime),
                 "suggestedCommands": suggested_commands,
                 "targetNodeOptions": self._target_node_options(),
+                "conversationRound": runtime.conversation_round,
+                "roundHistory": list(runtime.round_history),
+                "intentRouterPolicy": intent_router_policy,
+                "intentLogs": intent_logs[-20:],
                 "history": list(runtime.history),
                 "errors": list(state["errors"]),
             }

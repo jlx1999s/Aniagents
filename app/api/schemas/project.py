@@ -69,5 +69,9 @@ class ProjectSnapshot(BaseModel):
     executionPlanSummary: str
     suggestedCommands: List[str]
     targetNodeOptions: List[dict]
+    conversationRound: Optional[int] = None
+    roundHistory: Optional[List[dict]] = None
+    intentRouterPolicy: Optional[dict] = None
+    intentLogs: Optional[List[dict]] = None
     history: List[str]
     errors: List[dict]

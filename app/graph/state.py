@@ -39,6 +39,7 @@ class ManjuState(TypedDict):
     current_node: str
     route_reason: Optional[str]
     script_data: Dict[str, Any]
+    script_history: List[Dict[str, Any]]
     global_style: Dict[str, Any]
     character_assets: Dict[str, AssetMeta]
     storyboard_frames: List[AssetMeta]
@@ -52,6 +53,7 @@ class ManjuState(TypedDict):
     max_retry_by_node: Dict[str, int]
     iteration_count: int
     max_iterations: int
+    intent_router_policy: Dict[str, Any]
     cost_usage: Dict[str, float]
     timing_ms: Dict[str, int]
     timing_last_ms: Dict[str, int]
@@ -59,6 +61,8 @@ class ManjuState(TypedDict):
 
 
 def create_initial_state(user_prompt: str, project_id: Optional[str] = None) -> ManjuState:
+    from app.services.intent_router_policy import get_intent_router_policy, normalize_intent_router_policy
+
     resolved_project_id = project_id or str(uuid4())
     return ManjuState(
         project_id=resolved_project_id,
@@ -66,6 +70,7 @@ def create_initial_state(user_prompt: str, project_id: Optional[str] = None) -> 
         current_node="",
         route_reason=None,
         script_data={},
+        script_history=[],
         global_style={},
         character_assets={},
         storyboard_frames=[],
@@ -79,6 +84,7 @@ def create_initial_state(user_prompt: str, project_id: Optional[str] = None) -> 
         max_retry_by_node={},
         iteration_count=0,
         max_iterations=20,
+        intent_router_policy=normalize_intent_router_policy(get_intent_router_policy()),
         cost_usage={},
         timing_ms={},
         timing_last_ms={},

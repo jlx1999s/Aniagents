@@ -60,10 +60,21 @@ def scriptwriter_agent(state: ManjuState) -> ManjuState:
         f"请基于以下小说文本做分镜拆解并输出镜头段落：{state['user_prompt']}",
         stage="scriptwriter",
     )
-    state["script_data"] = {
+    script_data = {
         "scenes": _build_scenes(result, state["user_prompt"]),
         "raw": result,
     }
+    history = list(state.get("script_history") or [])
+    history.append(
+        {
+            "round": len(history) + 1,
+            "prompt": state.get("user_prompt", ""),
+            "scenes": script_data.get("scenes", []),
+            "raw": result,
+        }
+    )
+    state["script_history"] = history
+    state["script_data"] = script_data
     state["current_node"] = NODE_SCRIPTWRITER
     state["route_reason"] = NODE_SCRIPTWRITER
     return state

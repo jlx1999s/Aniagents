@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "updatedAt": "",
+  "rules": {
+    "mode": "hybrid",
+    "llmMinConfidence": 0.75,
+    "ruleHighConfidenceBypass": 0.91,
+    "forceRuleWhenAwaitingReview": true
+  }
+}

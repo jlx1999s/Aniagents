@@ -16,7 +16,9 @@ def storyboard_artist_agent(state: ManjuState) -> ManjuState:
         seed=7,
         qa_score=None if qa_result["status"] != "ok" else 0.9,
     )
-    state["storyboard_frames"] = [frame]
+    storyboard_frames = list(state.get("storyboard_frames") or [])
+    storyboard_frames.append(frame)
+    state["storyboard_frames"] = storyboard_frames
     state["approval_required"] = False
     state["approval_stage"] = None
     state["current_node"] = NODE_STORYBOARD_ARTIST

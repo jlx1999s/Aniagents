@@ -353,6 +353,84 @@ def _extract_json_payload(text: str) -> Dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def generate_intent_decision_tool(
+    *,
+    user_message: str,
+    status: str,
+    awaiting_review: bool,
+    current_stage: str,
+    allowed_intents: List[str],
+    available_nodes: List[str],
+) -> Dict[str, Any]:
+    route_info = _route_info("manager", "decision", "intent-mock")
+    route = route_info["route"]
+    provider = route.get("provider") or "mock"
+    model_name = route_info["model_name"]
+    fallback = {
+        "intent": "chat_only",
+        "target_node": None,
+        "confidence": 0.0,
+        "reason": "model_not_enabled",
+        "metadata": {"provider": provider, "model": model_name},
+    }
+    if provider != "vectorengine":
+        return fallback
+    prompt = (
+        "你是企业级对话意图路由器。请根据输入判断用户意图，只输出JSON对象，不要附加解释。\n"
+        "输出格式：{\"intent\":\"...\",\"target_node\":\"节点名或null\",\"confidence\":0-1,\"reason\":\"简短原因\"}\n"
+        f"user_message={user_message}\n"
+        f"status={status}\n"
+        f"awaiting_review={awaiting_review}\n"
+        f"current_stage={current_stage}\n"
+        f"allowed_intents={allowed_intents}\n"
+        f"available_nodes={available_nodes}\n"
+    )
+    try:
+        response = _vectorengine_response(
+            prompt,
+            route,
+            "你是稳定、保守的流程意图分类器。置信度必须客观，意图必须来自allowed_intents。",
+            timeout_seconds=12,
+        )
+        text = _extract_vectorengine_text(response)
+    except Exception as exc:
+        return {
+            **fallback,
+            "metadata": {
+                **fallback["metadata"],
+                "fallback_reason": "llm_request_failed",
+                "error": str(exc)[:160],
+            },
+        }
+    payload = _extract_json_payload(text)
+    intent = str(payload.get("intent") or "").strip()
+    target_node = payload.get("target_node")
+    confidence_raw = payload.get("confidence")
+    reason = str(payload.get("reason") or "").strip()
+    if intent not in allowed_intents:
+        return {
+            **fallback,
+            "metadata": {
+                **fallback["metadata"],
+                "fallback_reason": "invalid_llm_intent",
+            },
+        }
+    if target_node is not None and (not isinstance(target_node, str) or target_node not in available_nodes):
+        target_node = None
+    try:
+        confidence = float(confidence_raw)
+    except Exception:
+        confidence = 0.0
+    confidence = max(0.0, min(confidence, 1.0))
+    return {
+        "intent": intent,
+        "target_node": target_node,
+        "confidence": confidence,
+        "reason": reason or "llm_intent",
+        "metadata": {"provider": provider, "model": model_name},
+    }
+
+
 def generate_manager_decision_tool(
     *,
     available_nodes: List[str],

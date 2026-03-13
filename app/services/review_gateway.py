@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from app.graph.routing import NODE_ANIMATION_ARTIST
+from app.graph.routing import NODE_ANIMATION_ARTIST, NODE_STORYBOARD_ARTIST
 from app.graph.state import ManjuState
 from app.services.review_gateway_policy import get_review_gateway_policy
 
@@ -70,6 +70,14 @@ class ReviewGateway:
                 next_index=current_index,
                 reason="approval_required",
                 metadata={"approval_stage": state.get("approval_stage"), "policy_version": policy.get("version")},
+            )
+        if node_name == NODE_STORYBOARD_ARTIST:
+            return self._require_approval(
+                state=state,
+                current_index=current_index,
+                reason="storyboard_mandatory_review",
+                approval_stage="storyboard",
+                metadata={"node": node_name, "policy_version": policy.get("version")},
             )
         manual_nodes = rules.get("manualApprovalNodes")
         if isinstance(manual_nodes, list) and node_name in manual_nodes:
