@@ -4,23 +4,35 @@ import { officeCharacterLibrary } from '../config/officeCharacters';
 
 const nodeLabelMap = {
   Scriptwriter_Agent: '分镜拆解',
+  Art_Director_Agent: '美术设定',
   Character_Designer_Agent: '角色生成',
+  Scene_Designer_Agent: '场景生成',
   Storyboard_Artist_Agent: '分镜图生成',
-  Animation_Artist_Agent: '视频生成'
+  Animation_Artist_Agent: '视频生成',
+  Sound_Director_Agent: '音频设计',
+  Compositor_Agent: '合成输出'
 };
 
 const nodeActorMap = {
   Scriptwriter_Agent: '分镜师',
+  Art_Director_Agent: '美术总监',
   Character_Designer_Agent: '角色设计师',
+  Scene_Designer_Agent: '场景设计师',
   Storyboard_Artist_Agent: '分镜画师',
-  Animation_Artist_Agent: '动画师'
+  Animation_Artist_Agent: '动画师',
+  Sound_Director_Agent: '音频总监',
+  Compositor_Agent: '合成师'
 };
 
 const reviewStageByNode = {
   Scriptwriter_Agent: 'script',
+  Art_Director_Agent: 'style',
   Character_Designer_Agent: 'character',
+  Scene_Designer_Agent: 'scene',
   Storyboard_Artist_Agent: 'storyboard',
-  Animation_Artist_Agent: 'animation'
+  Animation_Artist_Agent: 'animation',
+  Sound_Director_Agent: 'audio',
+  Compositor_Agent: 'compositor'
 };
 
 function MediaCard({ item }) {
@@ -49,11 +61,23 @@ function targetNodeToPrompt(targetNode) {
   if (targetNode.includes('Scriptwriter')) {
     return '分镜拆解';
   }
+  if (targetNode.includes('Art_Director')) {
+    return '美术设定';
+  }
   if (targetNode.includes('Storyboard')) {
     return '分镜图';
   }
   if (targetNode.includes('Character')) {
     return '角色';
+  }
+  if (targetNode.includes('Scene')) {
+    return '场景';
+  }
+  if (targetNode.includes('Sound')) {
+    return '音频';
+  }
+  if (targetNode.includes('Compositor')) {
+    return '合成';
   }
   return '视频';
 }
@@ -157,6 +181,10 @@ const roleVisualByActor = {
     sprite: officeCharacterLibrary.Scriptwriter_Agent.sprite,
     accent: officeCharacterLibrary.Scriptwriter_Agent.accent
   },
+  场景设计师: {
+    sprite: officeCharacterLibrary.Scene_Designer_Agent.sprite,
+    accent: officeCharacterLibrary.Scene_Designer_Agent.accent
+  },
   角色设计师: {
     sprite: officeCharacterLibrary.Character_Designer_Agent.sprite,
     accent: officeCharacterLibrary.Character_Designer_Agent.accent
@@ -168,6 +196,18 @@ const roleVisualByActor = {
   动画师: {
     sprite: officeCharacterLibrary.Animation_Artist_Agent.sprite,
     accent: officeCharacterLibrary.Animation_Artist_Agent.accent
+  },
+  美术总监: {
+    sprite: officeCharacterLibrary.Art_Director_Agent.sprite,
+    accent: officeCharacterLibrary.Art_Director_Agent.accent
+  },
+  音频总监: {
+    sprite: officeCharacterLibrary.Sound_Director_Agent.sprite,
+    accent: officeCharacterLibrary.Sound_Director_Agent.accent
+  },
+  合成师: {
+    sprite: officeCharacterLibrary.Compositor_Agent.sprite,
+    accent: officeCharacterLibrary.Compositor_Agent.accent
   }
 };
 
@@ -199,12 +239,17 @@ export default function ProjectWorkspace({ snapshot, actions, onBack }) {
   const [policyRuleBypass, setPolicyRuleBypass] = useState(0.91);
   const [policyForceRuleReview, setPolicyForceRuleReview] = useState(true);
   const chatFeedRef = useRef(null);
+  const shouldStickToBottomRef = useRef(true);
   const workspaceMainRef = useRef(null);
   const stageText = {
     分镜拆解: '分镜拆解',
+    美术设定: '美术设定',
     角色生成: '角色生成',
+    场景生成: '场景生成',
     分镜图生成: '分镜图生成',
     视频生成: '视频生成',
+    音频设计: '音频设计',
+    合成输出: '合成输出',
     'Style Review': '风格确认'
   };
 
@@ -253,7 +298,7 @@ export default function ProjectWorkspace({ snapshot, actions, onBack }) {
     return [...chat, ...base, ...review];
   }, [snapshot.activityLogs, snapshot.chatLogs, snapshot.history, snapshot.reviewLogs]);
 
-  const gallery = snapshot.assetGallery || { characters: [], storyboards: [], videos: [] };
+  const gallery = snapshot.assetGallery || { characters: [], scenes: [], storyboards: [], videos: [] };
   const storyboardTable = snapshot.storyboardTable || [];
   const activeItems = activeTab === 'table' ? [] : gallery[activeTab] || [];
   const reviewNode = useMemo(() => resolveReviewNode(snapshot), [snapshot]);
@@ -275,8 +320,20 @@ export default function ProjectWorkspace({ snapshot, actions, onBack }) {
     if (!container) {
       return;
     }
+    if (!shouldStickToBottomRef.current) {
+      return;
+    }
     container.scrollTop = container.scrollHeight;
   }, [feed]);
+
+  const handleChatFeedScroll = () => {
+    const container = chatFeedRef.current;
+    if (!container) {
+      return;
+    }
+    const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    shouldStickToBottomRef.current = distanceToBottom < 24;
+  };
 
   useEffect(() => {
     const policy = snapshot.intentRouterPolicy || {};
@@ -543,9 +600,9 @@ export default function ProjectWorkspace({ snapshot, actions, onBack }) {
               </div>
             ) : null}
             <div className="workspace-chat-hint">
-              先输入小说文本，流程会按「分镜拆解 → 角色生成（风格确认）→ 分镜图生成 → 视频生成」推进。
+              先输入小说文本，流程会按「分镜拆解 → 美术设定（风格确认）→ 角色生成 → 场景生成 → 分镜图生成 → 视频生成 → 音频设计 → 合成输出」推进。
             </div>
-            <div className="chat-feed" ref={chatFeedRef}>
+            <div className="chat-feed" ref={chatFeedRef} onScroll={handleChatFeedScroll}>
               {feed.map((item) => {
                 const roleVisual = resolveRoleVisual(item.role);
                 return (
@@ -654,6 +711,13 @@ export default function ProjectWorkspace({ snapshot, actions, onBack }) {
                     onClick={() => setActiveTab('characters')}
                   >
                     人物图
+                  </button>
+                  <button
+                    type="button"
+                    className={`canvas-tab ${activeTab === 'scenes' ? 'active' : ''}`}
+                    onClick={() => setActiveTab('scenes')}
+                  >
+                    场景图
                   </button>
                   <button
                     type="button"

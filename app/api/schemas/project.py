@@ -41,6 +41,7 @@ class ReviewRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     operator_id: Optional[str] = "anonymous"
+    idempotency_key: Optional[str] = None
 
 
 class ProjectSnapshot(BaseModel):

@@ -1,7 +1,13 @@
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from app.graph.routing import NODE_ANIMATION_ARTIST, NODE_STORYBOARD_ARTIST
+from app.graph.routing import (
+    NODE_ANIMATION_ARTIST,
+    NODE_ART_DIRECTOR,
+    NODE_COMPOSITOR,
+    NODE_SCENE_DESIGNER,
+    NODE_STORYBOARD_ARTIST,
+)
 from app.graph.state import ManjuState
 from app.services.review_gateway_policy import get_review_gateway_policy
 
@@ -17,8 +23,18 @@ class ReviewGatewayDecision:
 
 class ReviewGateway:
     def _latest_qa_score(self, node_name: str, state: ManjuState) -> Any:
+        if node_name == "Art_Director_Agent":
+            style = state.get("global_style") or {}
+            if not isinstance(style, dict):
+                return None
+            return style.get("qa_score")
         if node_name == "Character_Designer_Agent":
             assets = list((state.get("character_assets") or {}).values())
+            if not assets:
+                return None
+            return assets[-1].get("qa_score")
+        if node_name == "Scene_Designer_Agent":
+            assets = list((state.get("scene_assets") or {}).values())
             if not assets:
                 return None
             return assets[-1].get("qa_score")
@@ -71,12 +87,28 @@ class ReviewGateway:
                 reason="approval_required",
                 metadata={"approval_stage": state.get("approval_stage"), "policy_version": policy.get("version")},
             )
+        if node_name == NODE_ART_DIRECTOR:
+            return self._require_approval(
+                state=state,
+                current_index=current_index,
+                reason="style_mandatory_review",
+                approval_stage="style",
+                metadata={"node": node_name, "policy_version": policy.get("version")},
+            )
         if node_name == NODE_STORYBOARD_ARTIST:
             return self._require_approval(
                 state=state,
                 current_index=current_index,
                 reason="storyboard_mandatory_review",
                 approval_stage="storyboard",
+                metadata={"node": node_name, "policy_version": policy.get("version")},
+            )
+        if node_name == NODE_SCENE_DESIGNER:
+            return self._require_approval(
+                state=state,
+                current_index=current_index,
+                reason="scene_mandatory_review",
+                approval_stage="scene",
                 metadata={"node": node_name, "policy_version": policy.get("version")},
             )
         manual_nodes = rules.get("manualApprovalNodes")
@@ -128,7 +160,7 @@ class ReviewGateway:
                             "policy_version": policy.get("version"),
                         },
                     )
-        if node_name == NODE_ANIMATION_ARTIST and state.get("final_video"):
+        if node_name == NODE_COMPOSITOR and state.get("final_video"):
             state["approval_required"] = False
             state["approval_stage"] = None
             return ReviewGatewayDecision(

@@ -8,15 +8,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Set
+from uuid import uuid4
 
 from app.agents.animation_artist import animation_artist_agent
+from app.agents.art_director import art_director_agent
 from app.agents.character_designer import character_designer_agent
+from app.agents.compositor import compositor_agent
+from app.agents.scene_designer import scene_designer_agent
 from app.agents.scriptwriter import scriptwriter_agent
+from app.agents.sound_director import sound_director_agent
 from app.agents.storyboard_artist import storyboard_artist_agent
 from app.graph.routing import (
     NODE_ANIMATION_ARTIST,
+    NODE_ART_DIRECTOR,
     NODE_CHARACTER_DESIGNER,
+    NODE_COMPOSITOR,
+    NODE_SCENE_DESIGNER,
     NODE_SCRIPTWRITER,
+    NODE_SOUND_DIRECTOR,
     NODE_STORYBOARD_ARTIST,
 )
 from app.graph.state import ManjuState, create_initial_state
@@ -28,32 +37,48 @@ from app.tools.mcp_client import generate_intent_decision_tool, generate_structu
 
 AGENT_SEQUENCE = [
     (NODE_SCRIPTWRITER, scriptwriter_agent, "分镜拆解"),
+    (NODE_ART_DIRECTOR, art_director_agent, "美术设定"),
     (NODE_CHARACTER_DESIGNER, character_designer_agent, "角色生成"),
+    (NODE_SCENE_DESIGNER, scene_designer_agent, "场景生成"),
     (NODE_STORYBOARD_ARTIST, storyboard_artist_agent, "分镜图生成"),
     (NODE_ANIMATION_ARTIST, animation_artist_agent, "视频生成"),
+    (NODE_SOUND_DIRECTOR, sound_director_agent, "音频设计"),
+    (NODE_COMPOSITOR, compositor_agent, "合成输出"),
 ]
 
 NODE_COST = {
     NODE_SCRIPTWRITER: 0.8,
+    NODE_ART_DIRECTOR: 0.6,
     NODE_CHARACTER_DESIGNER: 2.8,
+    NODE_SCENE_DESIGNER: 2.4,
     NODE_STORYBOARD_ARTIST: 2.6,
     NODE_ANIMATION_ARTIST: 4.2,
+    NODE_SOUND_DIRECTOR: 1.5,
+    NODE_COMPOSITOR: 1.1,
 }
 
 NODE_ETA = {
     NODE_SCRIPTWRITER: "00:02:40",
+    NODE_ART_DIRECTOR: "00:01:40",
     NODE_CHARACTER_DESIGNER: "00:03:30",
+    NODE_SCENE_DESIGNER: "00:03:00",
     NODE_STORYBOARD_ARTIST: "00:02:50",
     NODE_ANIMATION_ARTIST: "00:04:20",
+    NODE_SOUND_DIRECTOR: "00:02:10",
+    NODE_COMPOSITOR: "00:01:50",
 }
 
 STAGE_TO_INDEX = {stage[0]: idx for idx, stage in enumerate(AGENT_SEQUENCE)}
 NODE_LABELS = {stage[0]: stage[2] for stage in AGENT_SEQUENCE}
 NODE_ACTORS = {
     NODE_SCRIPTWRITER: "分镜师",
+    NODE_ART_DIRECTOR: "美术总监",
     NODE_CHARACTER_DESIGNER: "角色设计师",
+    NODE_SCENE_DESIGNER: "场景设计师",
     NODE_STORYBOARD_ARTIST: "分镜画师",
     NODE_ANIMATION_ARTIST: "动画师",
+    NODE_SOUND_DIRECTOR: "音频总监",
+    NODE_COMPOSITOR: "合成师",
 }
 
 MAX_REVIEW_LOGS = 120
@@ -62,9 +87,15 @@ MAX_ACTIVITY_LOGS = 320
 MAX_INTENT_LOGS = 120
 MAX_HISTORY_EVENTS = 300
 MAX_ROUND_HISTORY = 40
+MAX_AGENT_MEMORY_ITEMS = 20
+MAX_HANDOFF_MEMORY_ITEMS = 80
+MAX_IDEMPOTENCY_CACHE_ITEMS = 128
+IDEMPOTENCY_TTL_SECONDS = 60
+MAX_QUEUED_CHAT_COMMANDS = 20
 
 AGENT_ALLOWED_STATE_WRITES: Dict[str, Set[str]] = {
     NODE_SCRIPTWRITER: {"script_data", "script_history", "current_node", "route_reason"},
+    NODE_ART_DIRECTOR: {"global_style", "current_node", "route_reason"},
     NODE_CHARACTER_DESIGNER: {
         "global_style",
         "character_assets",
@@ -73,6 +104,7 @@ AGENT_ALLOWED_STATE_WRITES: Dict[str, Set[str]] = {
         "current_node",
         "route_reason",
     },
+    NODE_SCENE_DESIGNER: {"scene_assets", "current_node", "route_reason"},
     NODE_STORYBOARD_ARTIST: {
         "storyboard_frames",
         "approval_required",
@@ -81,6 +113,8 @@ AGENT_ALLOWED_STATE_WRITES: Dict[str, Set[str]] = {
         "route_reason",
     },
     NODE_ANIMATION_ARTIST: {"video_clips", "final_video", "current_node", "route_reason"},
+    NODE_SOUND_DIRECTOR: {"audio_tracks", "current_node", "route_reason"},
+    NODE_COMPOSITOR: {"final_video", "current_node", "route_reason"},
 }
 
 
@@ -115,6 +149,7 @@ class ProjectRuntime:
     activity_logs: List[Dict[str, object]] = field(default_factory=list)
     conversation_round: int = 1
     round_history: List[Dict[str, object]] = field(default_factory=list)
+    execution_inflight: bool = False
     snapshot_cache_version: int = 0
     snapshot_cache_payload: Optional[Dict[str, object]] = None
     compact_snapshot_cache_version: int = 0
@@ -177,6 +212,7 @@ class ProjectOrchestrator:
             "activity_logs": runtime.activity_logs,
             "conversation_round": runtime.conversation_round,
             "round_history": runtime.round_history,
+            "execution_inflight": runtime.execution_inflight,
         }
 
     def _deserialize_runtime(self, payload: Dict[str, Any]) -> Optional[ProjectRuntime]:
@@ -200,15 +236,274 @@ class ProjectOrchestrator:
             activity_logs=list(payload.get("activity_logs", [])),
             conversation_round=max(1, int(payload.get("conversation_round", 1))),
             round_history=list(payload.get("round_history", [])),
+            execution_inflight=bool(payload.get("execution_inflight", False)),
         )
 
     def _ensure_state_defaults(self, state: Dict[str, Any]) -> None:
         state.setdefault("script_history", [])
+        state.setdefault("scene_assets", {})
+        state.setdefault("shared_memory", {})
+        state.setdefault("agent_memory", {})
+        state.setdefault("handoff_memory", [])
+        state.setdefault("last_chat_command", {})
+        state.setdefault("queued_chat_command", None)
+        state.setdefault("queued_chat_commands", [])
+        state.setdefault("chat_idempotency_cache", {})
         state.setdefault("version", 1)
         state.setdefault("timing_ms", {})
         state.setdefault("timing_last_ms", {})
         state.setdefault("cost_usage", {})
         state.setdefault("errors", [])
+        if not isinstance(state.get("shared_memory"), dict):
+            state["shared_memory"] = {}
+        if not isinstance(state.get("agent_memory"), dict):
+            state["agent_memory"] = {}
+        if not isinstance(state.get("handoff_memory"), list):
+            state["handoff_memory"] = []
+        if not isinstance(state.get("last_chat_command"), dict):
+            state["last_chat_command"] = {}
+        legacy_queued = state.get("queued_chat_command")
+        if legacy_queued is not None and not isinstance(legacy_queued, dict):
+            state["queued_chat_command"] = None
+            legacy_queued = None
+        queued_commands = state.get("queued_chat_commands")
+        if not isinstance(queued_commands, list):
+            queued_commands = []
+            state["queued_chat_commands"] = queued_commands
+        if isinstance(legacy_queued, dict) and not queued_commands:
+            queued_commands.append(legacy_queued)
+            state["queued_chat_command"] = None
+        normalized_queue: List[Dict[str, Any]] = []
+        for item in queued_commands:
+            if isinstance(item, dict):
+                normalized_queue.append(item)
+        state["queued_chat_commands"] = normalized_queue[-MAX_QUEUED_CHAT_COMMANDS:]
+        if not isinstance(state.get("chat_idempotency_cache"), dict):
+            state["chat_idempotency_cache"] = {}
+
+    def _is_duplicate_idempotency_key(self, runtime: ProjectRuntime, key: str) -> bool:
+        cache = runtime.state.get("chat_idempotency_cache")
+        if not isinstance(cache, dict):
+            cache = {}
+            runtime.state["chat_idempotency_cache"] = cache
+        now = time.time()
+        expired_keys: List[str] = []
+        for cached_key, cached_at in cache.items():
+            try:
+                at = float(cached_at)
+            except Exception:
+                at = 0.0
+            if now - at > IDEMPOTENCY_TTL_SECONDS:
+                expired_keys.append(cached_key)
+        for expired_key in expired_keys:
+            cache.pop(expired_key, None)
+        if key in cache:
+            return True
+        cache[key] = now
+        if len(cache) > MAX_IDEMPOTENCY_CACHE_ITEMS:
+            ordered = sorted(cache.items(), key=lambda item: float(item[1]))
+            overflow = len(cache) - MAX_IDEMPOTENCY_CACHE_ITEMS
+            for stale_key, _ in ordered[:overflow]:
+                cache.pop(stale_key, None)
+        return False
+
+    def _is_duplicate_chat_command(self, runtime: ProjectRuntime, text: str, operator_id: str) -> bool:
+        payload = runtime.state.get("last_chat_command")
+        if not isinstance(payload, dict):
+            return False
+        last_text = str(payload.get("message") or "")
+        last_operator = str(payload.get("operator") or "")
+        last_intent = str(payload.get("intent") or "")
+        last_index = int(payload.get("currentIndex", -1))
+        try:
+            last_at = float(payload.get("at") or 0.0)
+        except Exception:
+            last_at = 0.0
+        if time.time() - last_at > 8:
+            return False
+        return (
+            last_text == text
+            and last_operator == operator_id
+            and last_intent in {"prompt_update", "continue_pipeline", "revise_existing"}
+            and last_index == runtime.current_index
+            and bool(payload.get("awaitingReview")) == runtime.awaiting_review
+            and str(payload.get("status") or "") == runtime.status
+        )
+
+    def _enqueue_chat_command(self, runtime: ProjectRuntime, text: str, operator_id: str) -> str:
+        queue = runtime.state.get("queued_chat_commands")
+        if not isinstance(queue, list):
+            queue = []
+            runtime.state["queued_chat_commands"] = queue
+        command_payload = {
+            "id": f"chat_{uuid4().hex}",
+            "message": text,
+            "operator": operator_id,
+            "at": time.time(),
+        }
+        queue.append(command_payload)
+        if len(queue) > MAX_QUEUED_CHAT_COMMANDS:
+            del queue[: len(queue) - MAX_QUEUED_CHAT_COMMANDS]
+        runtime.state["queued_chat_command"] = command_payload
+        return str(command_payload["id"])
+
+    def _pop_queued_chat_command(self, runtime: ProjectRuntime) -> Optional[Dict[str, str]]:
+        queue = runtime.state.get("queued_chat_commands")
+        payload = None
+        if isinstance(queue, list) and queue:
+            payload = queue.pop(0)
+        elif isinstance(runtime.state.get("queued_chat_command"), dict):
+            payload = runtime.state.get("queued_chat_command")
+        runtime.state["queued_chat_command"] = queue[0] if isinstance(queue, list) and queue else None
+        if not isinstance(payload, dict):
+            return None
+        message = str(payload.get("message") or "").strip()
+        operator = str(payload.get("operator") or "anonymous")
+        command_id = str(payload.get("id") or f"chat_{uuid4().hex}")
+        if not message:
+            return None
+        return {"id": command_id, "message": message, "operator": operator}
+
+    def _sync_shared_memory(self, runtime: ProjectRuntime) -> None:
+        state = runtime.state
+        current_stage = "completed"
+        if runtime.current_index < len(AGENT_SEQUENCE):
+            current_stage = AGENT_SEQUENCE[runtime.current_index][2]
+        if runtime.awaiting_review and state.get("approval_stage"):
+            current_stage = f"{state.get('approval_stage')}_review"
+        shared_memory = {
+            "userGoal": state.get("user_prompt", ""),
+            "styleBaseline": dict(state.get("global_style") or {}),
+            "assetIndex": {
+                "scriptCount": len(state.get("script_history") or []),
+                "characterCount": len(state.get("character_assets") or {}),
+                "sceneCount": len(state.get("scene_assets") or {}),
+                "storyboardCount": len(state.get("storyboard_frames") or []),
+                "videoCount": len(state.get("video_clips") or []),
+                "audioCount": len(state.get("audio_tracks") or {}),
+                "hasFinalVideo": bool(state.get("final_video")),
+            },
+            "approval": {
+                "required": bool(runtime.awaiting_review),
+                "stage": state.get("approval_stage"),
+            },
+            "currentStage": current_stage,
+            "status": runtime.status,
+            "updatedAt": time.time(),
+        }
+        state["shared_memory"] = shared_memory
+
+    def _collect_output_refs(
+        self, node_name: str, before_state: Dict[str, Any], after_state: Dict[str, Any]
+    ) -> List[Dict[str, str]]:
+        refs: List[Dict[str, str]] = []
+        before_script_len = len(before_state.get("script_history") or [])
+        after_script_history = after_state.get("script_history") or []
+        if len(after_script_history) > before_script_len:
+            refs.append({"type": "script", "id": f"script_{len(after_script_history)}"})
+        before_character = before_state.get("character_assets") or {}
+        after_character = after_state.get("character_assets") or {}
+        if isinstance(before_character, dict) and isinstance(after_character, dict):
+            for key, asset in after_character.items():
+                if key in before_character:
+                    continue
+                refs.append({"type": "character", "id": str(asset.get("asset_id") or key)})
+        before_scenes = before_state.get("scene_assets") or {}
+        after_scenes = after_state.get("scene_assets") or {}
+        if isinstance(before_scenes, dict) and isinstance(after_scenes, dict):
+            for key, asset in after_scenes.items():
+                if key in before_scenes:
+                    continue
+                refs.append({"type": "scene", "id": str(asset.get("asset_id") or key)})
+        before_storyboards = before_state.get("storyboard_frames") or []
+        after_storyboards = after_state.get("storyboard_frames") or []
+        if isinstance(before_storyboards, list) and isinstance(after_storyboards, list):
+            for frame in after_storyboards[len(before_storyboards) :]:
+                refs.append({"type": "storyboard", "id": str(frame.get("asset_id") or "storyboard_frame")})
+        before_videos = before_state.get("video_clips") or []
+        after_videos = after_state.get("video_clips") or []
+        if isinstance(before_videos, list) and isinstance(after_videos, list):
+            for clip in after_videos[len(before_videos) :]:
+                refs.append({"type": "video", "id": str(clip.get("asset_id") or "video_clip")})
+        before_audio = before_state.get("audio_tracks") or {}
+        after_audio = after_state.get("audio_tracks") or {}
+        if isinstance(before_audio, dict) and isinstance(after_audio, dict):
+            for key, track in after_audio.items():
+                if key in before_audio:
+                    continue
+                refs.append({"type": "audio", "id": str(track.get("asset_id") or key)})
+        if after_state.get("final_video") and after_state.get("final_video") != before_state.get("final_video"):
+            final_asset = after_state.get("final_video") or {}
+            refs.append({"type": "final_video", "id": str(final_asset.get("asset_id") or "final_video")})
+        return refs
+
+    def _append_agent_memory(
+        self,
+        runtime: ProjectRuntime,
+        node_name: str,
+        before_state: Dict[str, Any],
+        after_state: Dict[str, Any],
+        latency_ms: int,
+    ) -> List[Dict[str, str]]:
+        changed_fields = sorted(
+            [
+                key
+                for key in set(before_state.keys()) | set(after_state.keys())
+                if before_state.get(key) != after_state.get(key)
+            ]
+        )
+        output_refs = self._collect_output_refs(node_name, before_state, after_state)
+        agent_memory = runtime.state.setdefault("agent_memory", {})
+        node_memory = agent_memory.setdefault(node_name, {})
+        if not isinstance(node_memory, dict):
+            node_memory = {}
+            agent_memory[node_name] = node_memory
+        actions = node_memory.setdefault("recentActions", [])
+        if not isinstance(actions, list):
+            actions = []
+            node_memory["recentActions"] = actions
+        actions.append(
+            {
+                "at": time.time(),
+                "step": runtime.step_count + 1,
+                "status": runtime.status,
+                "latencyMs": max(latency_ms, 0),
+                "changedFields": changed_fields,
+                "outputRefs": output_refs,
+            }
+        )
+        if len(actions) > MAX_AGENT_MEMORY_ITEMS:
+            del actions[:-MAX_AGENT_MEMORY_ITEMS]
+        node_memory["lastOutputRefs"] = output_refs
+        return output_refs
+
+    def _append_handoff_memory(
+        self, runtime: ProjectRuntime, from_node: str, to_node: Optional[str], output_refs: List[Dict[str, str]]
+    ) -> None:
+        if not to_node:
+            return
+        handoff_memory = runtime.state.setdefault("handoff_memory", [])
+        if not isinstance(handoff_memory, list):
+            handoff_memory = []
+            runtime.state["handoff_memory"] = handoff_memory
+        handoff_memory.append(
+            {
+                "at": time.time(),
+                "fromNode": from_node,
+                "toNode": to_node,
+                "fromRole": self._actor_name(from_node),
+                "toRole": self._actor_name(to_node),
+                "goal": runtime.state.get("user_prompt", ""),
+                "constraints": {
+                    "styleKeys": sorted(list((runtime.state.get("global_style") or {}).keys())),
+                    "awaitingReview": bool(runtime.awaiting_review),
+                    "approvalStage": runtime.state.get("approval_stage"),
+                },
+                "inputRefs": output_refs,
+            }
+        )
+        if len(handoff_memory) > MAX_HANDOFF_MEMORY_ITEMS:
+            del handoff_memory[:-MAX_HANDOFF_MEMORY_ITEMS]
 
     def _db_connect_locked(self) -> sqlite3.Connection:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -264,15 +559,46 @@ class ProjectOrchestrator:
         connection = self._db_connect_locked()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DELETE FROM projects_runtime")
             if records:
                 connection.executemany(
                     """
-                    INSERT INTO projects_runtime (project_id, payload, updated_at)
+                    INSERT OR REPLACE INTO projects_runtime (project_id, payload, updated_at)
                     VALUES (?, ?, ?)
                     """,
                     records,
                 )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _persist_runtime_locked(self, project_id: str) -> None:
+        runtime = self._store.get(project_id)
+        if runtime is None:
+            return
+        record = (
+            project_id,
+            json.dumps(self._serialize_runtime(runtime), ensure_ascii=False),
+            time.time(),
+        )
+        connection = self._db_connect_locked()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO projects_runtime (project_id, payload, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                record,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _delete_runtime_locked(self, project_id: str) -> None:
+        connection = self._db_connect_locked()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM projects_runtime WHERE project_id = ?", (project_id,))
             connection.commit()
         finally:
             connection.close()
@@ -311,6 +637,7 @@ class ProjectOrchestrator:
             runtime = ProjectRuntime(state=state)
             self._ensure_state_defaults(runtime.state)
             runtime.state["intent_router_policy"] = normalize_intent_router_policy(get_intent_router_policy())
+            self._sync_shared_memory(runtime)
             self._append_history(runtime, "project_created")
             self._append_chat_log(runtime, "用户", user_prompt)
             self._append_chat_log(runtime, "Agent", self._agent_guidance(runtime))
@@ -320,7 +647,7 @@ class ProjectOrchestrator:
                 {"prompt": user_prompt, "projectId": state["project_id"]},
             )
             self._store[state["project_id"]] = runtime
-            self._persist_store_locked()
+            self._persist_runtime_locked(state["project_id"])
             return state["project_id"]
 
     def get_runtime(self, project_id: str) -> Optional[ProjectRuntime]:
@@ -333,7 +660,6 @@ class ProjectOrchestrator:
             if runtime is None:
                 raise KeyError(project_id)
             policy = self._runtime_intent_router_policy(runtime)
-            self._persist_store_locked()
             return json.loads(json.dumps(policy))
 
     def set_project_intent_router_policy(self, project_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -353,7 +679,7 @@ class ProjectOrchestrator:
             runtime.state["intent_router_policy"] = normalized
             self._append_state_event(runtime, "intent_router_policy_updated", {"policy": normalized})
             self._bump_state_version(runtime, "intent_policy_update")
-            self._persist_store_locked()
+            self._persist_runtime_locked(project_id)
             return json.loads(json.dumps(normalized))
 
     def list_project_ids(self) -> List[str]:
@@ -387,7 +713,7 @@ class ProjectOrchestrator:
             if project_id not in self._store:
                 return False
             del self._store[project_id]
-            self._persist_store_locked()
+            self._delete_runtime_locked(project_id)
             return True
 
     def delete_projects(self, project_ids: List[str]) -> int:
@@ -396,9 +722,8 @@ class ProjectOrchestrator:
             for project_id in project_ids:
                 if project_id in self._store:
                     del self._store[project_id]
+                    self._delete_runtime_locked(project_id)
                     deleted_count += 1
-            if deleted_count > 0:
-                self._persist_store_locked()
             return deleted_count
 
     def _mark_approval_resolved(self, runtime: ProjectRuntime) -> None:
@@ -572,6 +897,7 @@ class ProjectOrchestrator:
         self, runtime: ProjectRuntime, state: ManjuState
     ) -> Dict[str, List[Dict[str, object]]]:
         characters: List[Dict[str, object]] = []
+        scenes: List[Dict[str, object]] = []
         storyboards: List[Dict[str, object]] = []
         videos: List[Dict[str, object]] = []
         for item in runtime.activity_logs:
@@ -589,19 +915,26 @@ class ProjectOrchestrator:
                 continue
             if asset_type == "character":
                 characters.append(_build_asset_preview(asset, "character"))
+            elif asset_type == "scene":
+                scenes.append(_build_asset_preview(asset, "scene"))
             elif asset_type == "storyboard":
                 storyboards.append(_build_asset_preview(asset, "storyboard"))
             elif asset_type == "video":
                 videos.append(_build_asset_preview(asset, "video"))
-        if characters or storyboards or videos:
+        if characters or scenes or storyboards or videos:
             return {
                 "characters": characters,
+                "scenes": scenes,
                 "storyboards": storyboards,
                 "videos": videos,
             }
         character_gallery = [
             _build_asset_preview(asset, "character")
             for asset in state.get("character_assets", {}).values()
+        ]
+        scene_gallery = [
+            _build_asset_preview(asset, "scene")
+            for asset in state.get("scene_assets", {}).values()
         ]
         storyboard_gallery = [
             _build_asset_preview(asset, "storyboard")
@@ -615,6 +948,7 @@ class ProjectOrchestrator:
             video_gallery.append(_build_asset_preview(state["final_video"], "video"))
         return {
             "characters": character_gallery,
+            "scenes": scene_gallery,
             "storyboards": storyboard_gallery,
             "videos": video_gallery,
         }
@@ -641,20 +975,32 @@ class ProjectOrchestrator:
         node = self._next_node(runtime)
         if node == NODE_SCRIPTWRITER:
             return ["开始分镜拆解", "重做分镜拆解，节奏更快", "分镜拆解偏电影感"]
+        if node == NODE_ART_DIRECTOR:
+            return ["开始美术设定", "美术风格更统一", "整体色板改为低饱和电影风"]
         if node == NODE_CHARACTER_DESIGNER:
             return ["开始角色生成", "重做角色，风格更统一", "角色更年轻化，线条更干净"]
+        if node == NODE_SCENE_DESIGNER:
+            return ["开始场景生成", "重做场景，空间层次更强", "场景氛围更贴合剧情张力"]
         if node == NODE_STORYBOARD_ARTIST:
             return ["开始分镜图生成", "重做分镜图，镜头更有冲击力", "分镜图增加近景特写"]
         if node == NODE_ANIMATION_ARTIST:
             return ["开始视频生成", "重做视频，动作更流畅", "视频节奏更紧凑"]
+        if node == NODE_SOUND_DIRECTOR:
+            return ["开始音频设计", "重做配音与音效", "背景音乐更有史诗感"]
+        if node == NODE_COMPOSITOR:
+            return ["开始合成输出", "重做合成，提升节奏", "字幕与混音再优化"]
         return ["开始下一阶段", "重做当前阶段", "按默认参数继续"]
 
     def _target_node_options(self) -> List[Dict[str, str]]:
         return [
             {"node": NODE_SCRIPTWRITER, "label": "分镜拆解"},
-            {"node": NODE_CHARACTER_DESIGNER, "label": "角色设计"},
+            {"node": NODE_ART_DIRECTOR, "label": "美术设定"},
+            {"node": NODE_CHARACTER_DESIGNER, "label": "角色生成"},
+            {"node": NODE_SCENE_DESIGNER, "label": "场景生成"},
             {"node": NODE_STORYBOARD_ARTIST, "label": "分镜图"},
             {"node": NODE_ANIMATION_ARTIST, "label": "视频"},
+            {"node": NODE_SOUND_DIRECTOR, "label": "音频"},
+            {"node": NODE_COMPOSITOR, "label": "合成"},
         ]
 
     def _agent_guidance(self, runtime: ProjectRuntime) -> str:
@@ -666,7 +1012,7 @@ class ProjectOrchestrator:
             return f"项目已结束。{plan_summary} 建议指令：{suggestions}。"
         if runtime.awaiting_review:
             return (
-                f"角色风格已生成，请先确认风格再进入下一阶段。{plan_summary} "
+                f"当前存在审核门禁，请先完成审核再进入下一阶段。{plan_summary} "
                 f"建议指令：{suggestions}。"
             )
         node = self._next_node(runtime)
@@ -802,10 +1148,18 @@ class ProjectOrchestrator:
             scenes = state.get("script_data", {}).get("scenes", [])
             count = len(scenes) if isinstance(scenes, list) else 0
             return f"分镜拆解完成，已生成{count}个镜头段落。"
+        if node_name == NODE_ART_DIRECTOR:
+            style = state.get("global_style", {})
+            palette = style.get("palette") if isinstance(style, dict) else None
+            return f"美术设定完成，已建立全局风格基线（色板：{palette or '默认'}）。"
         if node_name == NODE_CHARACTER_DESIGNER:
             assets = state.get("character_assets", {})
             count = len(assets) if isinstance(assets, dict) else 0
             return f"角色设计完成，已输出{count}个角色资产。"
+        if node_name == NODE_SCENE_DESIGNER:
+            assets = state.get("scene_assets", {})
+            count = len(assets) if isinstance(assets, dict) else 0
+            return f"场景生成完成，已输出{count}个场景资产。"
         if node_name == NODE_STORYBOARD_ARTIST:
             frames = state.get("storyboard_frames", [])
             count = len(frames) if isinstance(frames, list) else 0
@@ -814,6 +1168,13 @@ class ProjectOrchestrator:
             clips = state.get("video_clips", [])
             count = len(clips) if isinstance(clips, list) else 0
             return f"视频生成完成，已输出{count}段视频素材。"
+        if node_name == NODE_SOUND_DIRECTOR:
+            tracks = state.get("audio_tracks", {})
+            count = len(tracks) if isinstance(tracks, dict) else 0
+            return f"音频设计完成，已生成{count}条音频轨道。"
+        if node_name == NODE_COMPOSITOR:
+            final_video = state.get("final_video")
+            return "合成输出完成，已产出最终成片。" if final_video else "合成执行完成，等待最终成片确认。"
         return "节点执行完成。"
 
     def _append_chat_log(self, runtime: ProjectRuntime, role: str, message: str) -> None:
@@ -846,6 +1207,11 @@ class ProjectOrchestrator:
                 "payload": payload,
             }
         )
+
+    def _invalidate_runtime_cache(self, runtime: ProjectRuntime) -> None:
+        runtime.snapshot_cache_payload = None
+        runtime.compact_snapshot_cache_payload = None
+        runtime.sse_cache_payload = ""
 
     def _state_version(self, runtime: ProjectRuntime) -> int:
         current = runtime.state.get("version")
@@ -908,6 +1274,18 @@ class ProjectOrchestrator:
                     {"node": node_name, "assetType": "character", "assetKey": key, "asset": asset},
                 )
 
+        before_scenes = before_state.get("scene_assets") or {}
+        after_scenes = after_state.get("scene_assets") or {}
+        if isinstance(before_scenes, dict) and isinstance(after_scenes, dict):
+            for key, asset in after_scenes.items():
+                if key in before_scenes:
+                    continue
+                self._append_state_event(
+                    runtime,
+                    "asset_added",
+                    {"node": node_name, "assetType": "scene", "assetKey": key, "asset": asset},
+                )
+
         before_storyboards = before_state.get("storyboard_frames") or []
         after_storyboards = after_state.get("storyboard_frames") or []
         if isinstance(before_storyboards, list) and isinstance(after_storyboards, list):
@@ -939,14 +1317,22 @@ class ProjectOrchestrator:
         text = message.lower()
         if "拆解" in message or "小说" in message or "script" in text:
             return NODE_SCRIPTWRITER
+        if "美术" in message or "风格" in message or "style" in text or "art" in text:
+            return NODE_ART_DIRECTOR
         if "角色" in message or "character" in text:
             return NODE_CHARACTER_DESIGNER
+        if "场景" in message or "scene" in text or "环境" in message:
+            return NODE_SCENE_DESIGNER
         if "分镜图" in message or "storyboard image" in text:
             return NODE_STORYBOARD_ARTIST
         if "分镜" in message or "storyboard" in text:
             return NODE_SCRIPTWRITER
         if "视频" in message or "动画" in message or "animation" in text or "video" in text:
             return NODE_ANIMATION_ARTIST
+        if "音频" in message or "配音" in message or "bgm" in text or "sound" in text or "audio" in text:
+            return NODE_SOUND_DIRECTOR
+        if "合成" in message or "混音" in message or "compositor" in text or "compose" in text:
+            return NODE_COMPOSITOR
         return None
 
     def _contains_any(self, text: str, keywords: List[str]) -> bool:
@@ -1110,6 +1496,26 @@ class ProjectOrchestrator:
         selected_intent = "chat_only"
         selected_target: Optional[str] = None
         reason = "default_chat_fallback"
+        current_node = self._next_node(runtime)
+        has_generated_assets = any(
+            [
+                bool(runtime.state.get("script_history")),
+                bool(runtime.state.get("character_assets")),
+                bool(runtime.state.get("scene_assets")),
+                bool(runtime.state.get("storyboard_frames")),
+                bool(runtime.state.get("video_clips")),
+                bool(runtime.state.get("audio_tracks")),
+                bool(runtime.state.get("final_video")),
+            ]
+        )
+        can_soft_update_prompt = (
+            runtime.status == "running"
+            and not runtime.awaiting_review
+            and current_node == NODE_SCRIPTWRITER
+            and runtime.current_index == STAGE_TO_INDEX[NODE_SCRIPTWRITER]
+            and runtime.step_count <= 1
+            and not has_generated_assets
+        )
         if self._contains_any(text, ["放弃项目", "终止项目"]):
             selected_intent = "reject_project"
             reason = "matched_reject_keywords"
@@ -1118,7 +1524,7 @@ class ProjectOrchestrator:
             reason = "awaiting_review_with_approve_keywords"
         elif runtime.awaiting_review and self._contains_any(text, ["修改风格", "风格", "改成", "换成"]):
             selected_intent = "revise_style"
-            selected_target = NODE_CHARACTER_DESIGNER
+            selected_target = NODE_ART_DIRECTOR
             reason = "awaiting_review_with_style_keywords"
         elif self._contains_any(text, ["重做", "返修", "修改"]):
             selected_intent = "revise_existing"
@@ -1126,7 +1532,7 @@ class ProjectOrchestrator:
             reason = "matched_revise_keywords"
         elif (
             not runtime.awaiting_review
-            and runtime.current_index == STAGE_TO_INDEX[NODE_CHARACTER_DESIGNER]
+            and runtime.current_index in {STAGE_TO_INDEX[NODE_ART_DIRECTOR], STAGE_TO_INDEX[NODE_CHARACTER_DESIGNER]}
             and self._contains_any(text, ["电影感", "镜头", "运镜", "构图", "节奏", "分镜"])
         ):
             selected_intent = "revise_script"
@@ -1151,6 +1557,10 @@ class ProjectOrchestrator:
             selected_intent = "prompt_update"
             selected_target = NODE_SCRIPTWRITER
             reason = "script_stage_free_text_prompt"
+        if selected_intent == "new_creation" and can_soft_update_prompt:
+            selected_intent = "prompt_update"
+            selected_target = NODE_SCRIPTWRITER
+            reason = "new_creation_downgraded_to_prompt_update"
         base_result = {
             "intent": selected_intent,
             "target": selected_target,
@@ -1158,13 +1568,26 @@ class ProjectOrchestrator:
             "reason": reason,
             "source": "rule_router_v2",
         }
-        return self._llm_refine_intent(
+        refined_result = self._llm_refine_intent(
             runtime=runtime,
             text=text,
             rule_intent=str(base_result["intent"]),
             rule_target=base_result["target"] if isinstance(base_result["target"], str) else None,
             rule_confidence=float(base_result["confidence"]),
         )
+        if can_soft_update_prompt and refined_result.get("intent") == "new_creation":
+            refined_result["intent"] = "prompt_update"
+            refined_result["target"] = NODE_SCRIPTWRITER
+            refined_result["confidence"] = max(float(refined_result.get("confidence") or 0.0), 0.9)
+            refined_result["reason"] = "new_creation_guard_prompt_update"
+            refined_result["source"] = "rule_guard_v1"
+        if can_soft_update_prompt and refined_result.get("intent") == "chat_only":
+            refined_result["intent"] = "prompt_update"
+            refined_result["target"] = NODE_SCRIPTWRITER
+            refined_result["confidence"] = max(float(refined_result.get("confidence") or 0.0), 0.88)
+            refined_result["reason"] = "chat_only_guard_prompt_update"
+            refined_result["source"] = "rule_guard_v1"
+        return refined_result
 
     def _start_new_creation_cycle(self, runtime: ProjectRuntime, prompt: str, operator_id: str) -> None:
         self._ensure_state_defaults(runtime.state)
@@ -1186,6 +1609,9 @@ class ProjectOrchestrator:
         runtime.state["retry_count_by_node"] = {}
         runtime.state["iteration_count"] = 0
         runtime.state["errors"] = []
+        runtime.state["agent_memory"] = {}
+        runtime.state["handoff_memory"] = []
+        runtime.state["shared_memory"] = {}
         runtime.current_index = STAGE_TO_INDEX[NODE_SCRIPTWRITER]
         runtime.status = "running"
         runtime.awaiting_review = False
@@ -1208,6 +1634,7 @@ class ProjectOrchestrator:
             "creation_cycle_started",
             {"round": runtime.conversation_round, "prompt": prompt, "operator": operator_id},
         )
+        self._sync_shared_memory(runtime)
         self._append_history(runtime, "chat_new_cycle_started")
 
     def submit_review(
@@ -1286,11 +1713,18 @@ class ProjectOrchestrator:
                 self._append_history(runtime, "review_rejected")
             else:
                 raise ValueError("invalid_action")
+            self._sync_shared_memory(runtime)
             self._bump_state_version(runtime, "submit_review", {"action": action})
-            self._persist_store_locked()
+            self._persist_runtime_locked(project_id)
             return runtime
 
-    def chat_and_operate(self, project_id: str, message: str, operator_id: str = "anonymous") -> ProjectRuntime:
+    def chat_and_operate(
+        self,
+        project_id: str,
+        message: str,
+        operator_id: str = "anonymous",
+        idempotency_key: Optional[str] = None,
+    ) -> ProjectRuntime:
         text = (message or "").strip()
         if not text:
             raise ValueError("empty_message")
@@ -1299,6 +1733,34 @@ class ProjectOrchestrator:
             if runtime is None:
                 raise KeyError(project_id)
             self._ensure_state_defaults(runtime.state)
+            resolved_idempotency_key = str(idempotency_key or "").strip()
+            if resolved_idempotency_key and self._is_duplicate_idempotency_key(runtime, resolved_idempotency_key):
+                return runtime
+            if runtime.execution_inflight:
+                self._append_chat_log(runtime, operator_id, text)
+                queued_id = self._enqueue_chat_command(runtime, text, operator_id)
+                queue_size = len(runtime.state.get("queued_chat_commands") or [])
+                self._append_activity(
+                    runtime,
+                    "chat_queued",
+                    {
+                        "actor": "系统",
+                        "reason": "execution_inflight",
+                        "operator": operator_id,
+                        "commandId": queued_id,
+                        "queueSize": queue_size,
+                    },
+                )
+                self._append_chat_log(
+                    runtime,
+                    "系统",
+                    "当前节点执行中，已为你排队该指令，节点完成后将自动处理。",
+                )
+                self._invalidate_runtime_cache(runtime)
+                self._persist_runtime_locked(project_id)
+                return runtime
+            if self._is_duplicate_chat_command(runtime, text, operator_id):
+                return runtime
             assistant_target_node: Optional[str] = None
             director_dispatch_required = False
             self._append_chat_log(runtime, operator_id, text)
@@ -1393,7 +1855,7 @@ class ProjectOrchestrator:
                 director_dispatch_required = assistant_target_node is not None
             elif intent == "revise_style":
                 runtime.state["global_style"]["user_feedback"] = text
-                runtime.current_index = STAGE_TO_INDEX[NODE_CHARACTER_DESIGNER]
+                runtime.current_index = STAGE_TO_INDEX[NODE_ART_DIRECTOR]
                 self._mark_approval_resolved(runtime)
                 runtime.status = "running"
                 self._append_review_log(
@@ -1405,11 +1867,11 @@ class ProjectOrchestrator:
                         "issue_type": "chat_style_feedback",
                         "priority": "high",
                         "message": text,
-                        "target_node": NODE_CHARACTER_DESIGNER,
+                        "target_node": NODE_ART_DIRECTOR,
                     },
                 )
                 self._append_history(runtime, "chat_revise_style")
-                assistant_target_node = NODE_CHARACTER_DESIGNER
+                assistant_target_node = NODE_ART_DIRECTOR
                 director_dispatch_required = True
             elif intent == "revise_existing":
                 target = intent_result.get("target")
@@ -1454,8 +1916,19 @@ class ProjectOrchestrator:
             else:
                 assistant_message = self._agent_chat_reply(runtime, text)
                 self._append_chat_log(runtime, "导演", assistant_message)
+            runtime.state["last_chat_command"] = {
+                "message": text,
+                "operator": operator_id,
+                "intent": intent,
+                "currentIndex": runtime.current_index,
+                "awaitingReview": runtime.awaiting_review,
+                "status": runtime.status,
+                "at": time.time(),
+            }
+            self._sync_shared_memory(runtime)
             self._bump_state_version(runtime, "chat_and_operate", {"intent": intent})
-            self._persist_store_locked()
+            self._invalidate_runtime_cache(runtime)
+            self._persist_runtime_locked(project_id)
             return runtime
 
     def advance(self, project_id: str, force: bool = False) -> ProjectRuntime:
@@ -1469,12 +1942,16 @@ class ProjectOrchestrator:
             if runtime is None:
                 raise KeyError(project_id)
             self._ensure_state_defaults(runtime.state)
+            if runtime.execution_inflight:
+                self._persist_runtime_locked(project_id)
+                return runtime
             if runtime.status in {"completed", "rejected", "failed"}:
-                self._persist_store_locked()
+                runtime.execution_inflight = False
+                self._persist_runtime_locked(project_id)
                 return runtime
             now = time.time()
             if not force and now - runtime.last_advanced_at < 1.2:
-                self._persist_store_locked()
+                self._persist_runtime_locked(project_id)
                 return runtime
             runtime.last_advanced_at = now
             preferred_node = None
@@ -1503,22 +1980,26 @@ class ProjectOrchestrator:
             )
             if decision.action == "await_review":
                 runtime.status = "waiting_review"
-                self._persist_store_locked()
+                runtime.execution_inflight = False
+                self._persist_runtime_locked(project_id)
                 return runtime
             if decision.action == "complete":
                 runtime.status = "completed"
                 runtime.awaiting_review = False
                 runtime.current_index = len(AGENT_SEQUENCE)
-                self._persist_store_locked()
+                runtime.execution_inflight = False
+                self._persist_runtime_locked(project_id)
                 return runtime
             if decision.action != "execute" or not decision.next_node:
-                self._persist_store_locked()
+                runtime.execution_inflight = False
+                self._persist_runtime_locked(project_id)
                 return runtime
             selected_index = STAGE_TO_INDEX.get(decision.next_node, runtime.current_index)
             node_name, handler, _ = AGENT_SEQUENCE[selected_index]
             runtime.current_index = selected_index
             runtime.awaiting_review = False
             runtime.status = "running"
+            runtime.execution_inflight = True
             runtime.state["current_node"] = node_name
             execute_base_version = self._bump_state_version(
                 runtime,
@@ -1526,7 +2007,7 @@ class ProjectOrchestrator:
                 {"node": node_name, "index": selected_index},
             )
             execute_state = deepcopy(runtime.state)
-            self._persist_store_locked()
+            self._persist_runtime_locked(project_id)
         try:
             execute_started_at = time.perf_counter()
             execution = self._tool_executor.execute(
@@ -1544,9 +2025,11 @@ class ProjectOrchestrator:
                 self._ensure_state_defaults(runtime.state)
                 runtime.status = "failed"
                 runtime.awaiting_review = False
+                runtime.execution_inflight = False
                 runtime.state["errors"].append({"node": node_name, "error": str(exc)})
                 self._bump_state_version(runtime, "advance_failed", {"node": node_name})
-                self._persist_store_locked()
+                self._invalidate_runtime_cache(runtime)
+                self._persist_runtime_locked(project_id)
                 return runtime
         with self._lock:
             runtime = self._store.get(project_id)
@@ -1555,6 +2038,7 @@ class ProjectOrchestrator:
             self._ensure_state_defaults(runtime.state)
             current_version = self._state_version(runtime)
             if isinstance(execute_base_version, int) and current_version != execute_base_version:
+                runtime.execution_inflight = False
                 conflict_payload = {
                     "node": node_name,
                     "expectedVersion": execute_base_version,
@@ -1573,11 +2057,18 @@ class ProjectOrchestrator:
                         "node": node_name,
                     },
                 )
-                self._persist_store_locked()
+                self._invalidate_runtime_cache(runtime)
+                self._persist_runtime_locked(project_id)
                 return runtime
             before_state = deepcopy(runtime.state)
+            queued_commands_snapshot = list(runtime.state.get("queued_chat_commands") or [])
             runtime.state = execution.state
             self._ensure_state_defaults(runtime.state)
+            runtime.state["queued_chat_commands"] = queued_commands_snapshot[-MAX_QUEUED_CHAT_COMMANDS:]
+            runtime.state["queued_chat_command"] = (
+                runtime.state["queued_chat_commands"][0] if runtime.state["queued_chat_commands"] else None
+            )
+            runtime.execution_inflight = False
             self._append_execution_state_events(runtime, node_name, before_state, runtime.state)
             timing_ms = runtime.state.setdefault("timing_ms", {})
             timing_ms[node_name] = int(timing_ms.get(node_name, 0)) + max(elapsed_ms, 0)
@@ -1623,18 +2114,67 @@ class ProjectOrchestrator:
             runtime.awaiting_review = gateway_decision.awaiting_review
             runtime.status = gateway_decision.status
             runtime.current_index = gateway_decision.next_index
+            output_refs = self._append_agent_memory(
+                runtime=runtime,
+                node_name=node_name,
+                before_state=before_state,
+                after_state=runtime.state,
+                latency_ms=elapsed_ms,
+            )
+            next_node = None
+            if runtime.current_index < len(AGENT_SEQUENCE):
+                next_node = AGENT_SEQUENCE[runtime.current_index][0]
+            self._append_handoff_memory(runtime, node_name, next_node, output_refs)
             if runtime.state["iteration_count"] > runtime.state["max_iterations"]:
                 runtime.status = "failed"
                 runtime.state["errors"].append(
                     {"node": "Director_Agent", "error": "max_iterations_exceeded"}
                 )
+            self._sync_shared_memory(runtime)
             self._bump_state_version(
                 runtime,
                 "advance_commit",
                 {"node": node_name, "elapsedMs": elapsed_ms, "status": runtime.status},
             )
-            self._persist_store_locked()
-            return runtime
+            self._invalidate_runtime_cache(runtime)
+            self._persist_runtime_locked(project_id)
+        while True:
+            queued_command_to_replay = None
+            with self._lock:
+                runtime = self._store.get(project_id)
+                if runtime is None:
+                    raise KeyError(project_id)
+                self._ensure_state_defaults(runtime.state)
+                if runtime.execution_inflight:
+                    self._persist_runtime_locked(project_id)
+                    return runtime
+                queued_command_to_replay = self._pop_queued_chat_command(runtime)
+                if queued_command_to_replay:
+                    self._append_activity(
+                        runtime,
+                        "chat_queue_drain",
+                        {
+                            "actor": "系统",
+                            "operator": queued_command_to_replay.get("operator") or "anonymous",
+                            "commandId": queued_command_to_replay.get("id"),
+                            "queueSize": len(runtime.state.get("queued_chat_commands") or []),
+                        },
+                    )
+                    self._invalidate_runtime_cache(runtime)
+                    self._persist_runtime_locked(project_id)
+            if not queued_command_to_replay:
+                break
+            self.chat_and_operate(
+                project_id=project_id,
+                message=queued_command_to_replay["message"],
+                operator_id=queued_command_to_replay["operator"],
+                idempotency_key=queued_command_to_replay.get("id"),
+            )
+        with self._lock:
+            runtime = self._store.get(project_id)
+            if runtime is None:
+                raise KeyError(project_id)
+        return runtime
 
     def _build_snapshot_payload(self, runtime: ProjectRuntime, compact: bool = False) -> Dict[str, object]:
         state = runtime.state
@@ -1676,7 +2216,7 @@ class ProjectOrchestrator:
             )
         final_video_uri = state["final_video"]["uri"] if state.get("final_video") else None
         if compact:
-            asset_gallery = {"characters": [], "storyboards": [], "videos": []}
+            asset_gallery = {"characters": [], "scenes": [], "storyboards": [], "videos": []}
             storyboard_table = []
             review_logs: List[Dict[str, object]] = []
             chat_logs: List[Dict[str, object]] = []
@@ -1709,6 +2249,9 @@ class ProjectOrchestrator:
             "characterCount": len(asset_gallery.get("characters", []))
             if not compact
             else len(state.get("character_assets", {})),
+            "sceneCount": len(asset_gallery.get("scenes", []))
+            if not compact
+            else len(state.get("scene_assets", {})),
             "storyboardCount": len(asset_gallery.get("storyboards", []))
             if not compact
             else len(state.get("storyboard_frames", [])),
@@ -1717,6 +2260,12 @@ class ProjectOrchestrator:
             else len(state.get("video_clips", [])),
             "audioCount": len(state.get("audio_tracks", {})),
             "finalVideoUri": final_video_uri,
+        }
+        handoff_memory = state.get("handoff_memory") or []
+        memory = {
+            "shared": state.get("shared_memory") or {},
+            "agentNodes": sorted(list((state.get("agent_memory") or {}).keys())),
+            "handoffRecent": list(handoff_memory[-(3 if compact else 8) :]),
         }
         return {
             "projectId": state["project_id"],
@@ -1748,6 +2297,7 @@ class ProjectOrchestrator:
             "roundHistory": round_history,
             "intentRouterPolicy": self._runtime_intent_router_policy(runtime),
             "intentLogs": intent_logs,
+            "memory": memory,
             "history": history_logs,
             "errors": list(state["errors"][-MAX_HISTORY_EVENTS:]),
             "stateVersion": self._state_version(runtime),

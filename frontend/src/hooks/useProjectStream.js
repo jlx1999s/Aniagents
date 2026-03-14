@@ -16,6 +16,16 @@ import {
 
 const PROJECT_SUMMARY_FETCH_LIMIT = 40;
 const PROJECT_SUMMARY_FETCH_CONCURRENCY = 6;
+const CHAT_AUTO_ADVANCE_MAX_STEPS = 6;
+const AUTO_ADVANCE_INTENTS = new Set([
+  'continue_pipeline',
+  'prompt_update',
+  'revise_script',
+  'revise_style',
+  'revise_existing',
+  'approve_review',
+  'new_creation'
+]);
 
 function normalizeErrorMessage(error, fallback) {
   const message = error instanceof Error ? error.message : '';
@@ -38,6 +48,26 @@ function chunkArray(items, size) {
   return chunks;
 }
 
+function latestIntentFromSnapshot(snapshot) {
+  const logs = snapshot?.intentLogs;
+  if (!Array.isArray(logs) || logs.length === 0) {
+    return '';
+  }
+  const last = logs[logs.length - 1];
+  return typeof last?.intent === 'string' ? last.intent : '';
+}
+
+function shouldAutoAdvanceAfterChat(snapshot) {
+  if (!snapshot || snapshot.status !== 'running' || snapshot.approvalRequired) {
+    return false;
+  }
+  return AUTO_ADVANCE_INTENTS.has(latestIntentFromSnapshot(snapshot));
+}
+
+function shouldContinueAutoAdvance(snapshot) {
+  return Boolean(snapshot && snapshot.status === 'running' && !snapshot.approvalRequired);
+}
+
 export default function useProjectStream() {
   const [snapshot, setSnapshot] = useState({
     projectId: '',
@@ -57,6 +87,7 @@ export default function useProjectStream() {
       scriptReady: false,
       styleReady: false,
       characterCount: 0,
+      sceneCount: 0,
       storyboardCount: 0,
       videoCount: 0,
       audioCount: 0,
@@ -64,6 +95,7 @@ export default function useProjectStream() {
     },
     assetGallery: {
       characters: [],
+      scenes: [],
       storyboards: [],
       videos: []
     },
@@ -388,10 +420,31 @@ export default function useProjectStream() {
         if (!content) {
           throw new Error('请输入内容后发送');
         }
-        const next = await submitProjectChat(projectId, {
+        let next = await submitProjectChat(projectId, {
           message: content,
           operator_id: '项目操作员'
         });
+        if (shouldAutoAdvanceAfterChat(next)) {
+          try {
+            let step = 0;
+            while (step < CHAT_AUTO_ADVANCE_MAX_STEPS && shouldContinueAutoAdvance(next)) {
+              const beforeVersion = Number(next?.stateVersion || 0);
+              const beforeStage = String(next?.stage || '');
+              const beforeNode = String(next?.currentNode || '');
+              next = await advanceProject(projectId);
+              const afterVersion = Number(next?.stateVersion || 0);
+              const afterStage = String(next?.stage || '');
+              const afterNode = String(next?.currentNode || '');
+              const progressed = afterVersion > beforeVersion || afterStage !== beforeStage || afterNode !== beforeNode;
+              step += 1;
+              if (!progressed) {
+                break;
+              }
+            }
+          } catch {
+            next = await getProjectSnapshot(projectId);
+          }
+        }
         setSnapshot(next);
         upsertSummary(next);
         await refreshProjectStats();

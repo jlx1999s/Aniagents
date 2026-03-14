@@ -6,6 +6,7 @@ from app.graph.routing import (
     NODE_CHARACTER_DESIGNER,
     NODE_COMPOSITOR,
     NODE_DIRECTOR,
+    NODE_SCENE_DESIGNER,
     NODE_SCRIPTWRITER,
     NODE_SOUND_DIRECTOR,
     NODE_STORYBOARD_ARTIST,
@@ -42,6 +43,8 @@ class RoutingTests(unittest.TestCase):
         state["route_reason"] = NODE_ART_DIRECTOR
         self.assertEqual(route_from_director(state), NODE_CHARACTER_DESIGNER)
         state["route_reason"] = NODE_CHARACTER_DESIGNER
+        self.assertEqual(route_from_director(state), NODE_SCENE_DESIGNER)
+        state["route_reason"] = NODE_SCENE_DESIGNER
         self.assertEqual(route_from_director(state), NODE_STORYBOARD_ARTIST)
         state["route_reason"] = NODE_STORYBOARD_ARTIST
         self.assertEqual(route_from_director(state), NODE_ANIMATION_ARTIST)

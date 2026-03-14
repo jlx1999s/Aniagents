@@ -48,6 +48,7 @@ const reviewNodeOptions = [
   { value: 'Scriptwriter_Agent', label: '剧本生成节点' },
   { value: 'Art_Director_Agent', label: '美术风格节点' },
   { value: 'Character_Designer_Agent', label: '角色设计节点' },
+  { value: 'Scene_Designer_Agent', label: '场景设计节点' },
   { value: 'Storyboard_Artist_Agent', label: '分镜节点' },
   { value: 'Animation_Artist_Agent', label: '动画节点' },
   { value: 'Sound_Director_Agent', label: '音频节点' },
@@ -178,6 +179,7 @@ export default function PipelinePanel({
               onChange={(event) => setField('stage', event.target.value)}
             >
               <option value="character">角色</option>
+              <option value="scene">场景</option>
               <option value="storyboard">分镜</option>
               <option value="animation">动画</option>
               <option value="audio">音频</option>
@@ -256,6 +258,7 @@ export default function PipelinePanel({
           <AssetRow label="剧本" value={snapshot.assets.scriptReady ? '已就绪' : '待生成'} />
           <AssetRow label="风格" value={snapshot.assets.styleReady ? '已就绪' : '待生成'} />
           <AssetRow label="角色资产" value={snapshot.assets.characterCount} />
+          <AssetRow label="场景资产" value={snapshot.assets.sceneCount} />
           <AssetRow label="分镜资产" value={snapshot.assets.storyboardCount} />
           <AssetRow label="视频片段" value={snapshot.assets.videoCount} />
           <AssetRow label="音频轨道" value={snapshot.assets.audioCount} />

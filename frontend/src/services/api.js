@@ -125,9 +125,12 @@ function classifyHttpError(status, bodyText) {
 async function request(path, options = {}) {
   const fetchOptions = buildRequestOptions(options);
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 12000;
+  const method = String(fetchOptions.method || 'GET').toUpperCase();
+  const canRetryAcrossBases = options.retryAcrossBases === true || method === 'GET' || method === 'HEAD';
   let lastError = null;
   const attemptedUrls = [];
-  for (const base of orderedApiBases()) {
+  const bases = canRetryAcrossBases ? orderedApiBases() : [orderedApiBases()[0]];
+  for (const base of bases) {
     try {
       const targetUrl = buildApiUrl(base, path);
       attemptedUrls.push(targetUrl);
@@ -198,22 +201,29 @@ export function deleteProjectsBatch(projectIds) {
 
 export function advanceProject(projectId) {
   return request(`/api/projects/${projectId}/advance`, {
-    method: 'POST'
+    method: 'POST',
+    timeoutMs: 45000
   });
 }
 
 export function submitReview(projectId, payload) {
   return request(`/api/projects/${projectId}/review`, {
     method: 'POST',
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    timeoutMs: 45000
   });
 }
 
 export function submitProjectChat(projectId, payload) {
+  const idempotencyKey = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   return request(`/api/projects/${projectId}/chat`, {
     method: 'POST',
-    body: JSON.stringify(payload),
-    timeoutMs: 40000
+    body: JSON.stringify({
+      ...payload,
+      idempotency_key: payload?.idempotency_key || idempotencyKey
+    }),
+    timeoutMs: 90000,
+    retryAcrossBases: false
   }).catch((error) => {
     const message = error instanceof Error ? error.message : '';
     if (message.includes('接口路径不可用') || message.includes('request_failed_404')) {

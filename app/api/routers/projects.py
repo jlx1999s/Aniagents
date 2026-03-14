@@ -17,37 +17,16 @@ from app.api.schemas.project import (
 from app.services.orchestrator import orchestrator
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
-
-
-def _should_advance_from_chat(message: str) -> bool:
-    text = (message or "").strip()
-    if not text:
-        return False
-    keywords = [
-        "开始下一阶段",
-        "开始分镜拆解",
-        "开始角色生成",
-        "开始分镜图生成",
-        "开始视频生成",
-        "执行当前阶段",
-        "确认风格",
-        "通过",
-        "继续",
-        "重做",
-        "返修",
-        "修改风格",
-    ]
-    return any(keyword in text for keyword in keywords)
-
-
-def _should_auto_advance_after_prompt_update(runtime) -> bool:
-    if runtime.awaiting_review:
-        return False
-    if runtime.current_index != 0:
-        return False
-    if not runtime.history:
-        return False
-    return runtime.history[-1] in {"chat_update_prompt", "chat_revise_script"}
+CHAT_AUTO_ADVANCE_INTENTS = {
+    "continue_pipeline",
+    "prompt_update",
+    "revise_script",
+    "revise_style",
+    "revise_existing",
+    "approve_review",
+    "new_creation",
+}
+CHAT_AUTO_ADVANCE_MAX_STEPS = 6
 
 
 @router.get("", response_model=List[str])
@@ -131,13 +110,32 @@ def advance_project(project_id: str) -> ProjectSnapshot:
 @router.post("/{project_id}/chat", response_model=ProjectSnapshot)
 def chat_project(project_id: str, payload: ChatRequest) -> ProjectSnapshot:
     try:
-        runtime = orchestrator.chat_and_operate(
+        orchestrator.chat_and_operate(
             project_id=project_id,
             message=payload.message,
             operator_id=payload.operator_id or "anonymous",
+            idempotency_key=payload.idempotency_key,
         )
-        if _should_advance_from_chat(payload.message) or _should_auto_advance_after_prompt_update(runtime):
-            orchestrator.advance(project_id, force=True)
+        runtime = orchestrator.get_runtime(project_id)
+        if runtime is not None:
+            last_intent = str((runtime.state.get("last_chat_command") or {}).get("intent") or "")
+            if last_intent in CHAT_AUTO_ADVANCE_INTENTS:
+                for _ in range(CHAT_AUTO_ADVANCE_MAX_STEPS):
+                    runtime = orchestrator.get_runtime(project_id)
+                    if runtime is None:
+                        break
+                    if runtime.status != "running" or runtime.awaiting_review:
+                        break
+                    before_version = int(runtime.state.get("version") or 0)
+                    before_index = int(runtime.current_index)
+                    orchestrator.advance(project_id, force=True)
+                    runtime = orchestrator.get_runtime(project_id)
+                    if runtime is None:
+                        break
+                    after_version = int(runtime.state.get("version") or 0)
+                    after_index = int(runtime.current_index)
+                    if after_version <= before_version and after_index == before_index:
+                        break
         return ProjectSnapshot(**orchestrator.snapshot(project_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project_not_found") from exc

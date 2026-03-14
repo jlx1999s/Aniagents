@@ -8,21 +8,47 @@ const ROLE_MAPPING = {
     color: '#61afef',
     hair: '#d19a66',
     accessory: 'glasses',
-    deskX: 200,
-    deskY: 280,
+    deskX: 150,
+    deskY: 250,
     action: '正在绘制分镜...',
-    workLines: ['构图中', '镜头推进中', '节奏校对中']
+    workLines: ['构图中', '镜头推进中', '节奏校对中'],
+    restLines: ['这镜头甲方看不懂吧', '先歇会儿再想转场', '我怀疑导演又要加需求']
   },
   Character_Designer_Agent: {
     roleId: 'char_designer',
-    name: '角色设计',
+    name: '角色设计师',
     color: '#c678dd',
     hair: '#98c379',
     accessory: 'hair',
-    deskX: 600,
-    deskY: 280,
+    deskX: 480,
+    deskY: 250,
     action: '正在设定角色...',
-    workLines: ['角色设定中', '服装细化中', '表情调试中']
+    workLines: ['角色设定中', '服装细化中', '表情调试中'],
+    restLines: ['再改就第九版了', '这个发色到底定不定', '我快和图层融为一体了']
+  },
+  Scene_Designer_Agent: {
+    roleId: 'scene_designer',
+    name: '场景设计师',
+    color: '#7fdbca',
+    hair: '#4b5563',
+    accessory: 'pencil',
+    deskX: 650,
+    deskY: 250,
+    action: '正在生成场景...',
+    workLines: ['空间布局中', '氛围光效中', '环境细节中'],
+    restLines: ['这场景又要昼夜两版', '前景中景后景都在喊加班', '我怀疑透视线在嘲笑我']
+  },
+  Art_Director_Agent: {
+    roleId: 'art_director',
+    name: '美术总监',
+    color: '#e06c75',
+    hair: '#282c34',
+    accessory: 'beret',
+    deskX: 320,
+    deskY: 250,
+    action: '正在设定美术风格...',
+    workLines: ['色板校准中', '光照方案中', '风格基线中'],
+    restLines: ['统一风格比统一作息难', '这个配色谁拍板来着', '我先喝口水冷静一下']
   },
   Storyboard_Artist_Agent: {
     roleId: 'sb_drawer',
@@ -30,21 +56,47 @@ const ROLE_MAPPING = {
     color: '#98c379',
     hair: '#e5c07b',
     accessory: 'pencil',
-    deskX: 200,
-    deskY: 420,
+    deskX: 150,
+    deskY: 390,
     action: '正在细化线稿...',
-    workLines: ['线稿精修中', '透视校正中', '动作夸张中']
+    workLines: ['线稿精修中', '透视校正中', '动作夸张中'],
+    restLines: ['再加三格就不叫分镜了', '这个机位脖子要断了', '我先喘口气再补关键帧']
   },
   Animation_Artist_Agent: {
     roleId: 'video_editor',
-    name: '视频师',
+    name: '动画师',
     color: '#e5c07b',
     hair: '#5c6370',
     accessory: 'headphones',
-    deskX: 600,
-    deskY: 420,
+    deskX: 320,
+    deskY: 390,
     action: '正在剪辑合成...',
-    workLines: ['镜头拼接中', '节奏剪辑中', '特效合成中']
+    workLines: ['镜头拼接中', '节奏剪辑中', '特效合成中'],
+    restLines: ['渲染条跑得比我快', '这个过渡再卡我就重启', '今天的风扇声是战歌']
+  },
+  Sound_Director_Agent: {
+    roleId: 'sound_director',
+    name: '音频总监',
+    color: '#56b6c2',
+    hair: '#abb2bf',
+    accessory: 'headphones',
+    deskX: 480,
+    deskY: 390,
+    action: '正在混音配音...',
+    workLines: ['人声对齐中', '音效铺设中', 'BGM 混音中'],
+    restLines: ['噪音门限又炸了', 'BGM 再提我就耳鸣了', '这个口型同步太难了']
+  },
+  Compositor_Agent: {
+    roleId: 'compositor',
+    name: '合成师',
+    color: '#d19a66',
+    hair: '#4b5563',
+    accessory: 'glasses',
+    deskX: 650,
+    deskY: 390,
+    action: '正在成片合成...',
+    workLines: ['时间轴拼接中', '字幕校正中', '最终导出中'],
+    restLines: ['导出别崩就谢天谢地', '进度条到99最可怕', '这版再过不了我就睡公司']
   }
 };
 
@@ -55,12 +107,12 @@ const DIRECTOR_CONFIG = {
   hair: '#282c34',
   accessory: 'beret',
   deskX: 400,
-  deskY: 150,
+  deskY: 130,
   action: '正在统筹全局...',
   workLines: ['排期同步中', '质量复核中', '进度协调中']
 };
 
-const LOUNGE_AREA = { minX: 300, maxX: 500, minY: 480, maxY: 560 };
+const LOUNGE_AREA = { minX: 250, maxX: 550, minY: 500, maxY: 570 };
 const ENV_LABELS = {
   space: '🌌 宇宙星空模式',
   day_clear: '☀️ 晴朗白天模式',
@@ -92,7 +144,12 @@ function createBookshelfBooks() {
 }
 
 function getAgentWorkLine(config) {
-  const lines = Array.isArray(config.workLines) && config.workLines.length ? config.workLines : [config.action];
+  const workLines = Array.isArray(config.workLines) && config.workLines.length ? config.workLines : [config.action];
+  return workLines[Math.floor(Math.random() * workLines.length)];
+}
+
+function getAgentRestLine(config) {
+  const lines = Array.isArray(config.restLines) && config.restLines.length ? config.restLines : ['再坚持一下，下轮就顺了', '喝口水，继续冲'];
   return lines[Math.floor(Math.random() * lines.length)];
 }
 
@@ -177,7 +234,7 @@ class Agent {
     this.isWalking = false;
     this.speechBubble = null;
     this.speechTimer = 0;
-    this.speechCooldown = rand(800, 2200);
+    this.speechCooldown = rand(4000, 7000);
     this.subState = 'wander_idle';
     this.actionTimer = 0;
   }
@@ -202,7 +259,7 @@ class Agent {
       this.actionTimer = rand(1200, 2800);
       this.speechBubble = null;
       this.speechTimer = 0;
-      this.speechCooldown = rand(1800, 3000);
+      this.speechCooldown = rand(5000, 9000);
     }
 
     if (this.speechTimer > 0) {
@@ -276,6 +333,14 @@ class Agent {
     if (this.state === 'working' && this.speechTimer <= 0 && this.speechCooldown <= 0) {
       this.say(getAgentWorkLine(this.config), rand(1500, 2400));
       this.speechCooldown = rand(1500, 3200);
+    } else if (
+      this.state === 'wander' &&
+      this.speechTimer <= 0 &&
+      this.speechCooldown <= 0 &&
+      this.subState !== 'wander_walk'
+    ) {
+      this.say(getAgentRestLine(this.config), rand(1800, 2800));
+      this.speechCooldown = rand(7000, 12000);
     }
 
     return {
@@ -616,10 +681,10 @@ function drawFloor(ctx, width, height, env, stars, clouds, rainDrops, windLines)
     }
   }
 
-  const rx = 280;
-  const ry = 480;
-  const rw = 240;
-  const rh = 100;
+  const rx = LOUNGE_AREA.minX - 20;
+  const ry = LOUNGE_AREA.minY - 24;
+  const rw = LOUNGE_AREA.maxX - LOUNGE_AREA.minX + 40;
+  const rh = LOUNGE_AREA.maxY - LOUNGE_AREA.minY + 28;
   ctx.fillStyle = isDay ? 'rgba(50,50,66,0.8)' : 'rgba(30,30,46,0.8)';
   ctx.beginPath();
   ctx.roundRect(rx, ry, rw, rh, 12);

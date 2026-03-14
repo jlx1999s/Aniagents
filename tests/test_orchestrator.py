@@ -1,10 +1,16 @@
 import unittest
 from unittest.mock import patch
 
-from app.graph.routing import NODE_CHARACTER_DESIGNER, NODE_STORYBOARD_ARTIST
+from app.graph.routing import (
+    NODE_ART_DIRECTOR,
+    NODE_CHARACTER_DESIGNER,
+    NODE_SCENE_DESIGNER,
+    NODE_SCRIPTWRITER,
+    NODE_STORYBOARD_ARTIST,
+)
 from app.graph.state import create_initial_state
 from app.services.manager_agent import ManagerAgent
-from app.services.orchestrator import ProjectOrchestrator, orchestrator
+from app.services.orchestrator import ProjectOrchestrator, STAGE_TO_INDEX, orchestrator
 from app.services.intent_router_policy import get_intent_router_policy, set_intent_router_policy
 from app.services.review_gateway_policy import (
     get_review_gateway_policy,
@@ -43,7 +49,7 @@ class OrchestratorTests(unittest.TestCase):
             target_node=NODE_STORYBOARD_ARTIST,
             message="回到分镜",
         )
-        self.assertEqual(runtime.current_index, 2)
+        self.assertEqual(runtime.current_index, STAGE_TO_INDEX[NODE_STORYBOARD_ARTIST])
 
     def test_chat_command_flow(self):
         project_id = orchestrator.create_project("做一个机甲动漫")
@@ -222,6 +228,182 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(snapshot["intentLogs"][-1]["source"], "hybrid_router_v3")
         self.assertEqual(snapshot["intentLogs"][-1]["intent"], "continue_pipeline")
 
+    def test_new_creation_intent_is_guarded_to_prompt_update_at_script_start(self):
+        project_id = orchestrator.create_project("默认题材")
+        with patch(
+            "app.services.orchestrator.generate_intent_decision_tool",
+            return_value={
+                "intent": "new_creation",
+                "target_node": None,
+                "confidence": 0.97,
+                "reason": "llm_override_new_creation",
+            },
+        ):
+            runtime = orchestrator.chat_and_operate(
+                project_id=project_id,
+                message="帮我制作一段视频",
+                operator_id="测试用户",
+            )
+        self.assertEqual(runtime.state["user_prompt"], "帮我制作一段视频")
+        self.assertEqual(runtime.conversation_round, 1)
+        self.assertEqual(runtime.history[-1], "chat_update_prompt")
+        self.assertNotIn("chat_new_cycle_started", runtime.history[-3:])
+        snapshot = orchestrator.snapshot(project_id)
+        self.assertEqual(snapshot["intentLogs"][-1]["intent"], "prompt_update")
+        self.assertEqual(snapshot["intentLogs"][-1]["source"], "rule_guard_v1")
+
+    def test_chat_only_intent_is_guarded_to_prompt_update_at_script_start(self):
+        project_id = orchestrator.create_project("默认题材")
+        with patch(
+            "app.services.orchestrator.generate_intent_decision_tool",
+            return_value={
+                "intent": "chat_only",
+                "target_node": None,
+                "confidence": 0.96,
+                "reason": "llm_override_chat_only",
+            },
+        ):
+            runtime = orchestrator.chat_and_operate(
+                project_id=project_id,
+                message="小明喂狗",
+                operator_id="测试用户",
+            )
+        self.assertEqual(runtime.state["user_prompt"], "小明喂狗")
+        self.assertEqual(runtime.history[-1], "chat_update_prompt")
+        snapshot = orchestrator.snapshot(project_id)
+        self.assertEqual(snapshot["intentLogs"][-1]["intent"], "prompt_update")
+        self.assertEqual(snapshot["intentLogs"][-1]["reason"], "chat_only_guard_prompt_update")
+        self.assertEqual(snapshot["intentLogs"][-1]["source"], "rule_guard_v1")
+
+    def test_memory_layers_are_synced_after_advance(self):
+        project_id = orchestrator.create_project("未来城市守护者")
+        runtime = orchestrator.get_runtime(project_id)
+        self.assertIsNotNone(runtime)
+        self.assertIsInstance(runtime.state.get("shared_memory"), dict)
+        self.assertIsInstance(runtime.state.get("agent_memory"), dict)
+        self.assertIsInstance(runtime.state.get("handoff_memory"), list)
+        runtime = orchestrator.advance(project_id, force=True)
+        self.assertEqual(runtime.state.get("current_node"), NODE_SCRIPTWRITER)
+        shared_memory = runtime.state.get("shared_memory") or {}
+        self.assertEqual(shared_memory.get("userGoal"), "未来城市守护者")
+        self.assertEqual(shared_memory.get("currentStage"), "美术设定")
+        agent_memory = runtime.state.get("agent_memory") or {}
+        self.assertIn(NODE_SCRIPTWRITER, agent_memory)
+        recent_actions = (agent_memory.get(NODE_SCRIPTWRITER) or {}).get("recentActions") or []
+        self.assertGreaterEqual(len(recent_actions), 1)
+        handoff_memory = runtime.state.get("handoff_memory") or []
+        self.assertGreaterEqual(len(handoff_memory), 1)
+        latest_handoff = handoff_memory[-1]
+        self.assertEqual(latest_handoff.get("fromNode"), NODE_SCRIPTWRITER)
+        self.assertEqual(latest_handoff.get("toNode"), NODE_ART_DIRECTOR)
+        snapshot = orchestrator.snapshot(project_id, compact=True)
+        memory = snapshot.get("memory") or {}
+        self.assertEqual((memory.get("shared") or {}).get("userGoal"), "未来城市守护者")
+        self.assertIn(NODE_SCRIPTWRITER, memory.get("agentNodes") or [])
+
+    def test_duplicate_prompt_update_is_ignored_for_idempotency(self):
+        project_id = orchestrator.create_project("旧题材")
+        runtime = orchestrator.chat_and_operate(
+            project_id=project_id,
+            message="小明喂狗",
+            operator_id="测试用户",
+        )
+        first_version = runtime.state.get("version")
+        first_chat_count = len(runtime.chat_logs)
+        first_activity_count = len(runtime.activity_logs)
+        runtime = orchestrator.chat_and_operate(
+            project_id=project_id,
+            message="小明喂狗",
+            operator_id="测试用户",
+        )
+        self.assertEqual(runtime.state.get("version"), first_version)
+        self.assertEqual(len(runtime.chat_logs), first_chat_count)
+        self.assertEqual(len(runtime.activity_logs), first_activity_count)
+        self.assertEqual(runtime.history.count("chat_update_prompt"), 1)
+
+    def test_chat_idempotency_key_prevents_replay(self):
+        project_id = orchestrator.create_project("幂等键测试")
+        runtime = orchestrator.chat_and_operate(
+            project_id=project_id,
+            message="小明喂狗，先拆分镜头",
+            operator_id="测试用户",
+            idempotency_key="chat-1",
+        )
+        first_version = runtime.state.get("version")
+        first_chat_count = len(runtime.chat_logs)
+        runtime = orchestrator.chat_and_operate(
+            project_id=project_id,
+            message="继续推进",
+            operator_id="测试用户",
+            idempotency_key="chat-1",
+        )
+        self.assertEqual(runtime.state.get("version"), first_version)
+        self.assertEqual(len(runtime.chat_logs), first_chat_count)
+
+    def test_chat_command_is_queued_when_execution_inflight(self):
+        project_id = orchestrator.create_project("并发测试")
+        runtime = orchestrator.get_runtime(project_id)
+        self.assertIsNotNone(runtime)
+        runtime.execution_inflight = True
+        before_version = int(runtime.state.get("version", 0))
+        before_chat_count = len(runtime.chat_logs)
+        updated = orchestrator.chat_and_operate(
+            project_id=project_id,
+            message="开始分镜拆解",
+            operator_id="测试用户",
+        )
+        self.assertEqual(int(updated.state.get("version", 0)), before_version)
+        self.assertEqual(len(updated.chat_logs), before_chat_count + 2)
+        self.assertEqual(updated.chat_logs[-2]["role"], "测试用户")
+        self.assertEqual(updated.chat_logs[-1]["role"], "系统")
+        self.assertEqual(updated.activity_logs[-2]["kind"], "chat_queued")
+        self.assertTrue(updated.execution_inflight)
+        self.assertEqual(len(updated.state.get("queued_chat_commands") or []), 1)
+        self.assertIsInstance(updated.state.get("queued_chat_command"), dict)
+
+    def test_queued_chat_command_is_drained_after_advance(self):
+        project_id = orchestrator.create_project("旧题材")
+        runtime = orchestrator.get_runtime(project_id)
+        self.assertIsNotNone(runtime)
+        runtime.execution_inflight = True
+        orchestrator.chat_and_operate(
+            project_id=project_id,
+            message="小明喂狗",
+            operator_id="测试用户",
+        )
+        runtime.execution_inflight = False
+        updated = orchestrator.advance(project_id, force=True)
+        self.assertIsNone(updated.state.get("queued_chat_command"))
+        self.assertEqual(len(updated.state.get("queued_chat_commands") or []), 0)
+
+    def test_multiple_queued_chat_commands_are_drained_in_order(self):
+        project_id = orchestrator.create_project("多指令排队测试")
+        runtime = orchestrator.get_runtime(project_id)
+        self.assertIsNotNone(runtime)
+        runtime.execution_inflight = True
+        orchestrator.chat_and_operate(
+            project_id=project_id,
+            message="先改成热血风格",
+            operator_id="测试用户",
+        )
+        orchestrator.chat_and_operate(
+            project_id=project_id,
+            message="再强调主角成长线",
+            operator_id="测试用户",
+        )
+        runtime.execution_inflight = False
+        updated = orchestrator.advance(project_id, force=True)
+        self.assertIsNone(updated.state.get("queued_chat_command"))
+        self.assertEqual(len(updated.state.get("queued_chat_commands") or []), 0)
+        drain_logs = [item for item in updated.activity_logs if item.get("kind") == "chat_queue_drain"]
+        self.assertGreaterEqual(len(drain_logs), 2)
+        last_command = updated.state.get("last_chat_command") or {}
+        self.assertEqual(last_command.get("message"), "再强调主角成长线")
+        self.assertEqual(last_command.get("operator"), "测试用户")
+        kinds = [item.get("kind") for item in updated.activity_logs]
+        self.assertIn("chat_queue_drain", kinds)
+        self.assertIn("intent_router", kinds)
+
     def test_hybrid_intent_router_falls_back_when_llm_confidence_low(self):
         project_id = orchestrator.create_project("默认题材")
         with patch(
@@ -397,6 +579,13 @@ class OrchestratorTests(unittest.TestCase):
         restored = ProjectOrchestrator()
         self.assertIn(project_id, restored.list_project_ids())
 
+    def test_deleted_project_not_restored_from_sqlite(self):
+        local = ProjectOrchestrator()
+        project_id = local.create_project("删除持久化测试")
+        self.assertTrue(local.delete_project(project_id))
+        restored = ProjectOrchestrator()
+        self.assertNotIn(project_id, restored.list_project_ids())
+
     def test_manager_tool_gateway_activity_pipeline(self):
         project_id = orchestrator.create_project("企业级编排测试")
         runtime = orchestrator.advance(project_id, force=True)
@@ -430,7 +619,7 @@ class OrchestratorTests(unittest.TestCase):
             operator_id="测试用户",
         )
         self.assertEqual(runtime.chat_logs[-2]["role"], "导演")
-        self.assertEqual(runtime.chat_logs[-1]["role"], "角色设计师")
+        self.assertEqual(runtime.chat_logs[-1]["role"], "美术总监")
 
     def test_chat_approve_generates_director_dispatch_and_worker_reply(self):
         project_id = orchestrator.create_project("审批后双对话测试")
@@ -444,7 +633,7 @@ class OrchestratorTests(unittest.TestCase):
             operator_id="测试用户",
         )
         self.assertEqual(runtime.chat_logs[-2]["role"], "导演")
-        self.assertEqual(runtime.chat_logs[-1]["role"], "分镜画师")
+        self.assertEqual(runtime.chat_logs[-1]["role"], "角色设计师")
 
     def test_manager_llm_invalid_action_fallback_to_rule(self):
         manager = ManagerAgent()
@@ -533,6 +722,49 @@ class OrchestratorTests(unittest.TestCase):
         finally:
             set_review_gateway_policy(previous)
 
+    def test_scene_generation_requires_review(self):
+        previous = get_review_gateway_policy()
+        try:
+            set_review_gateway_policy(
+                {
+                    "version": 4,
+                    "rules": {
+                        "maxRenderCostBeforeApproval": None,
+                        "manualApprovalNodes": [],
+                        "minQaScoreByNode": {},
+                        "forceApprovalOnErrors": False,
+                    },
+                }
+            )
+            project_id = orchestrator.create_project("场景审核必经测试")
+            runtime = orchestrator.get_runtime(project_id)
+            self.assertIsNotNone(runtime)
+            for _ in range(12):
+                runtime = orchestrator.get_runtime(project_id)
+                if runtime is None:
+                    break
+                if runtime.awaiting_review:
+                    runtime = orchestrator.submit_review(
+                        project_id=project_id,
+                        action="approve",
+                        target_node=None,
+                        message="通过",
+                    )
+                    continue
+                runtime = orchestrator.advance(project_id, force=True)
+                if runtime.history and runtime.history[-1] == NODE_SCENE_DESIGNER:
+                    break
+            runtime = orchestrator.get_runtime(project_id)
+            self.assertIsNotNone(runtime)
+            self.assertTrue(runtime.awaiting_review)
+            self.assertEqual(runtime.state.get("approval_stage"), "scene")
+            snapshot = orchestrator.snapshot(project_id)
+            gateway_events = [item for item in snapshot["activityLogs"] if item["kind"] == "review_gateway"]
+            self.assertGreaterEqual(len(gateway_events), 1)
+            self.assertEqual(gateway_events[-1]["payload"]["reason"], "scene_mandatory_review")
+        finally:
+            set_review_gateway_policy(previous)
+
     def test_state_version_increments_across_writes(self):
         project_id = orchestrator.create_project("版本测试")
         initial_version = orchestrator.snapshot(project_id)["stateVersion"]
@@ -558,6 +790,8 @@ class OrchestratorTests(unittest.TestCase):
             target_node=None,
             message="通过",
         )
+        runtime = orchestrator.advance(project_id, force=True)
+        self.assertIn(runtime.status, {"running", "waiting_review"})
         snapshot = orchestrator.snapshot(project_id)
         state_events = [
             item["payload"]["event"]

@@ -5,6 +5,7 @@ StageLiteral = Literal[
     "script",
     "style",
     "character",
+    "scene",
     "storyboard",
     "animation",
     "audio",
@@ -42,6 +43,7 @@ class ManjuState(TypedDict):
     script_history: List[Dict[str, Any]]
     global_style: Dict[str, Any]
     character_assets: Dict[str, AssetMeta]
+    scene_assets: Dict[str, AssetMeta]
     storyboard_frames: List[AssetMeta]
     video_clips: List[AssetMeta]
     audio_tracks: Dict[str, AssetMeta]
@@ -54,6 +56,9 @@ class ManjuState(TypedDict):
     iteration_count: int
     max_iterations: int
     intent_router_policy: Dict[str, Any]
+    shared_memory: Dict[str, Any]
+    agent_memory: Dict[str, Dict[str, Any]]
+    handoff_memory: List[Dict[str, Any]]
     cost_usage: Dict[str, float]
     timing_ms: Dict[str, int]
     timing_last_ms: Dict[str, int]
@@ -74,6 +79,7 @@ def create_initial_state(user_prompt: str, project_id: Optional[str] = None) -> 
         script_history=[],
         global_style={},
         character_assets={},
+        scene_assets={},
         storyboard_frames=[],
         video_clips=[],
         audio_tracks={},
@@ -86,6 +92,9 @@ def create_initial_state(user_prompt: str, project_id: Optional[str] = None) -> 
         iteration_count=0,
         max_iterations=20,
         intent_router_policy=normalize_intent_router_policy(get_intent_router_policy()),
+        shared_memory={},
+        agent_memory={},
+        handoff_memory=[],
         cost_usage={},
         timing_ms={},
         timing_last_ms={},
