@@ -175,6 +175,19 @@ function resolveNodeStatus(snapshot, nodeName) {
   return '';
 }
 
+function hasNodeExecuted(snapshot, nodeName) {
+  const history = snapshot?.history;
+  if (!Array.isArray(history) || history.length === 0) {
+    return false;
+  }
+  return history.includes(nodeName);
+}
+
+function isPipelineFinished(snapshot) {
+  const status = snapshot?.status;
+  return status === 'completed' || status === 'rejected' || status === 'failed';
+}
+
 class Particle {
   constructor(x, y, type, color) {
     this.x = x;
@@ -246,12 +259,14 @@ class Agent {
 
   update(dt, desiredState) {
     let enteredWorking = false;
-    if (desiredState === 'working' && this.state !== 'working' && this.state !== 'going_to_desk') {
+    const wantsDesk =
+      desiredState === 'working' || desiredState === 'desk_idle';
+    if (wantsDesk && this.state !== 'working' && this.state !== 'going_to_desk' && this.state !== 'desk_idle') {
       this.state = 'going_to_desk';
       this.targetX = this.config.deskX;
       this.targetY = this.config.deskY + 8;
       this.subState = 'work_type';
-    } else if (desiredState !== 'working' && this.state !== 'wander') {
+    } else if (!wantsDesk && this.state !== 'wander') {
       this.state = 'wander';
       this.targetX = rand(LOUNGE_AREA.minX, LOUNGE_AREA.maxX);
       this.targetY = rand(LOUNGE_AREA.minY, LOUNGE_AREA.maxY);
@@ -260,6 +275,17 @@ class Agent {
       this.speechBubble = null;
       this.speechTimer = 0;
       this.speechCooldown = rand(5000, 9000);
+    } else if (desiredState === 'desk_idle' && this.state === 'working') {
+      this.state = 'desk_idle';
+      this.subState = 'desk_rest';
+      this.actionTimer = rand(2400, 4600);
+      this.facing = 'back';
+      this.speechCooldown = rand(2500, 5200);
+    } else if (desiredState === 'working' && this.state === 'desk_idle') {
+      this.state = 'working';
+      this.subState = 'work_type';
+      this.actionTimer = rand(2200, 5200);
+      this.facing = 'back';
     }
 
     if (this.speechTimer > 0) {
@@ -290,13 +316,24 @@ class Agent {
       this.walkCycle = 0;
 
       if (this.state === 'going_to_desk') {
-        this.state = 'working';
-        this.subState = 'work_type';
-        this.actionTimer = rand(2200, 5200);
+        if (desiredState === 'desk_idle') {
+          this.state = 'desk_idle';
+          this.subState = 'desk_rest';
+          this.actionTimer = rand(2400, 4600);
+        } else {
+          this.state = 'working';
+          this.subState = 'work_type';
+          this.actionTimer = rand(2200, 5200);
+        }
         this.facing = 'back';
-        this.say(getAgentWorkLine(this.config), rand(1500, 2400));
-        this.speechCooldown = rand(1500, 2600);
-        enteredWorking = true;
+        if (desiredState === 'working') {
+          this.say(getAgentWorkLine(this.config), rand(1500, 2400));
+          this.speechCooldown = rand(1500, 2600);
+          enteredWorking = true;
+        } else {
+          this.say(getAgentRestLine(this.config), rand(1600, 2600));
+          this.speechCooldown = rand(2600, 5200);
+        }
       } else if (this.state === 'wander') {
         if (this.actionTimer > 0) {
           this.actionTimer -= dt;
@@ -327,12 +364,21 @@ class Agent {
             this.actionTimer = rand(2600, 5200);
           }
         }
+      } else if (this.state === 'desk_idle') {
+        this.actionTimer -= dt;
+        if (this.actionTimer <= 0) {
+          this.subState = this.subState === 'desk_rest' ? 'desk_stretch' : 'desk_rest';
+          this.actionTimer = rand(2200, 4800);
+        }
       }
     }
 
     if (this.state === 'working' && this.speechTimer <= 0 && this.speechCooldown <= 0) {
       this.say(getAgentWorkLine(this.config), rand(1500, 2400));
       this.speechCooldown = rand(1500, 3200);
+    } else if (this.state === 'desk_idle' && this.speechTimer <= 0 && this.speechCooldown <= 0) {
+      this.say(getAgentRestLine(this.config), rand(1800, 2800));
+      this.speechCooldown = rand(5500, 10000);
     } else if (
       this.state === 'wander' &&
       this.speechTimer <= 0 &&
@@ -347,7 +393,9 @@ class Agent {
       enteredWorking,
       spawnWorkParticle: this.state === 'working' && this.subState === 'work_type' && Math.random() < 0.1,
       spawnIdeaParticle: this.state === 'working' && this.subState === 'work_think' && Math.random() < 0.012,
-      spawnZzzParticle: this.state === 'wander' && !this.isWalking && this.subState === 'wander_idle' && Math.random() < 0.01
+      spawnZzzParticle:
+        (this.state === 'wander' && !this.isWalking && this.subState === 'wander_idle' && Math.random() < 0.01) ||
+        (this.state === 'desk_idle' && Math.random() < 0.012)
     };
   }
 
@@ -359,7 +407,7 @@ class Agent {
     const bodyW = 14, bodyH = 12;
     const legW = 4, legH = 8;
 
-    const isSitting = this.state === 'working';
+    const isSitting = this.state === 'working' || this.state === 'desk_idle';
     const sitOffset = isSitting ? 5 : 0;
     if (!isSitting) {
       ctx.fillStyle = 'rgba(0,0,0,0.3)';
@@ -900,15 +948,32 @@ export default function AgentOfficeBoard({ snapshot, onQuickCommand }) {
 
   addLogRef.current = addLog;
 
+  const pipelineCompleted = isPipelineFinished(project);
+
   const agentStates = useMemo(() => {
     const states = {};
     Object.keys(ROLE_MAPPING).forEach((nodeName) => {
       const status = resolveNodeStatus(project, nodeName);
       const isWorking = status === 'running' || status === 'working' || status === 'review';
-      states[nodeName] = isWorking ? 'working' : 'wander';
+      const isCompleted =
+        status === 'completed' ||
+        status === 'succeeded' ||
+        status === 'success' ||
+        status === 'done' ||
+        status === 'approved' ||
+        hasNodeExecuted(project, nodeName);
+      if (isWorking) {
+        states[nodeName] = 'working';
+      } else if (pipelineCompleted) {
+        states[nodeName] = 'wander';
+      } else if (isCompleted) {
+        states[nodeName] = 'desk_idle';
+      } else {
+        states[nodeName] = 'wander';
+      }
     });
     return states;
-  }, [project]);
+  }, [pipelineCompleted, project]);
 
   useEffect(() => {
     const engine = engineRef.current;
@@ -970,9 +1035,13 @@ export default function AgentOfficeBoard({ snapshot, onQuickCommand }) {
     });
     const director = engine.agents.find((item) => item.id === 'director');
     if (director) {
-      director.desiredState = hasWorking ? 'working' : 'wander';
+      if (hasWorking) {
+        director.desiredState = 'working';
+      } else {
+        director.desiredState = pipelineCompleted ? 'wander' : 'desk_idle';
+      }
     }
-  }, [agentStates]);
+  }, [agentStates, pipelineCompleted]);
 
   useEffect(() => {
     const container = logContainerRef.current;
